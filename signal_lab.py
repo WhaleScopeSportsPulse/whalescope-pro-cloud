@@ -235,28 +235,33 @@ def cycle():
    record=record_cache
    if record:direction,strength,locked_at=record
    elif left<=780 and ready and historical:
-    # Compare live short-term momentum with historical candle trend, RSI, and volatility.
-    # No fabricated probability: disagreement is explicitly flagged.
-    # Forecast settlement against the actual strike, not just the current trend.
-    # Convert historical 5-minute ATR into a rough remaining-horizon volatility scale.
+    # Estimate FUTURE movement first, then compare the projected settlement to strike.
+    # The current winning side is NOT a directional vote.
     remaining_minutes=max(0.5,left/60)
     expected_move=max(spot*0.00012,historical["atr"]*math.sqrt(remaining_minutes/5))
     distance=(spot-target)/expected_move
-    # Momentum is bounded so a short spike cannot dominate the target distance.
     momentum_signal=max(-1.0,min(1.0,score/max(threshold,1)))
     trend_signal=max(-1.0,min(1.0,historical["votes"]/3))
-    # Recent reversals: short-term movement opposing the longer 2-minute move.
+    pattern_signal=max(-1.0,min(1.0,2*(historical.get("pattern_up",0.5)-0.5)))
     reversal=(p120 is not None and (spot-p30)*(spot-p120)<0 and
               abs(spot-p30)>threshold*0.5)
-    trend_weight=0.15 if reversal else 0.30
-    # Cap target-distance influence; heuristic pending historical validation.
-    distance_signal=max(-0.75,min(0.75,distance))
-    forecast=distance_signal+0.85*momentum_signal+trend_weight*trend_signal+0.35*(historical.get("pattern_up",0.5)-0.5)*2
+    # Reduce reliance on short-term momentum if it has started reversing.
+    momentum_weight=0.22 if reversal else 0.50
+    # Future movement estimate is independent of the current strike distance.
+    future_move=expected_move*(momentum_weight*momentum_signal+
+                               0.25*trend_signal+0.25*pattern_signal)
+    projected_finish=spot+future_move
+    forecast=(projected_finish-target)/expected_move
     direction="UP" if forecast>=0 else "DOWN"
-    agreement=(distance_signal*momentum_signal>0 and distance_signal*trend_signal>0 and not reversal)
-    strength=("MULTI-FACTOR AGREEMENT / UNCALIBRATED" if agreement else
+    # Record whether the model actually predicts a reversal of the current leader.
+    current_leader="UP" if spot>=target else "DOWN"
+    predicts_flip=(direction!=current_leader)
+    agreement=(momentum_signal*trend_signal>0 and
+               momentum_signal*pattern_signal>0 and not reversal)
+    strength=("PROJECTED REVERSAL / UNCALIBRATED" if predicts_flip else
               "REVERSAL RISK / UNCALIBRATED" if reversal else
-              "MIXED SIGNALS / LOW CONFIDENCE")
+              "MULTI-FACTOR AGREEMENT / UNCALIBRATED" if agreement else
+              "MIXED SIGNALS / UNCALIBRATED")
     locked_at=now
     if db_ready:
      lock(ticker,close,direction,strength,now)
