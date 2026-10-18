@@ -12,7 +12,7 @@ def stamp(x):
  except:return 0
 def btc(name):
  if name=="kraken":return float(next(iter(fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD")["result"].values()))["c"][0])
- if name=="coinbase":return float(fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot")["data"]["amount"])
+ if name=="coinbase":return float(fetch("https://api.exchange.coinbase.com/products/BTC-USD/ticker")["price"])
  return float(fetch("https://www.bitstamp.net/api/v2/ticker/btcusd/")["last"])
 def historical_analysis():
  # Kraken OHLC includes historical candles; the final candle may still be forming.
