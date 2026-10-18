@@ -175,13 +175,23 @@ def cycle():
    elif left<=420 and ready and historical:
     # Compare live short-term momentum with historical candle trend, RSI, and volatility.
     # No fabricated probability: disagreement is explicitly flagged.
-    momentum=1 if score>threshold else -1 if score< -threshold else 0
-    trend=historical["votes"]
-    target_side=1 if spot>=target else -1
-    weighted=trend+momentum+target_side
-    direction="UP" if weighted>0 else "DOWN" if weighted<0 else ("UP" if trend>0 else "DOWN")
-    agreement=(momentum==target_side and momentum!=0 and (trend>0)==(momentum>0))
+    # Forecast settlement against the actual strike, not just the current trend.
+    # Convert historical 5-minute ATR into a rough remaining-horizon volatility scale.
+    remaining_minutes=max(0.5,left/60)
+    expected_move=max(spot*0.00012,historical["atr"]*math.sqrt(remaining_minutes/5))
+    distance=(spot-target)/expected_move
+    # Momentum is bounded so a short spike cannot dominate the target distance.
+    momentum_signal=max(-1.0,min(1.0,score/max(threshold,1)))
+    trend_signal=max(-1.0,min(1.0,historical["votes"]/3))
+    # Recent reversals: short-term movement opposing the longer 2-minute move.
+    reversal=(p120 is not None and (spot-p30)*(spot-p120)<0 and
+              abs(spot-p30)>threshold*0.5)
+    trend_weight=0.15 if reversal else 0.30
+    forecast=distance+0.55*momentum_signal+trend_weight*trend_signal
+    direction="UP" if forecast>=0 else "DOWN"
+    agreement=(distance*momentum_signal>0 and distance*trend_signal>0 and not reversal)
     strength=("MULTI-FACTOR AGREEMENT / UNCALIBRATED" if agreement else
+              "REVERSAL RISK / UNCALIBRATED" if reversal else
               "MIXED SIGNALS / LOW CONFIDENCE")
     locked_at=now
     if db_ready:
