@@ -117,6 +117,23 @@ def model_audit():
   baseline=(0.55,0.3,0.35)
   return {"status":"SHADOW TEST","samples":len(rows),"holdout":len(test),"candidate_weights":selected,"candidate_accuracy":round(100*accuracy(test,selected),1),"baseline_accuracy":round(100*accuracy(test,baseline),1),"note":"Shadow evaluation only; live weights unchanged"}
  except Exception as ex:return {"status":"ERROR","error":str(ex)[:120]}
+def adaptive_weights():
+ # Promote weights only after chronological holdout improvement.
+ baseline=(0.50,0.25,0.25)
+ try:
+  c=connect();q=c.cursor()
+  q.execute("SELECT f.distance,f.momentum,f.trend,f.pattern,e.result FROM signal_lab_features_v2 f JOIN signal_lab_eval_v1 e ON f.ticker=e.ticker WHERE e.result IN ('yes','no') ORDER BY e.close_ts")
+  rows=q.fetchall();c.close()
+  if len(rows)<90:return baseline
+  train=rows[:-30];test=rows[-30:]
+  candidates=[(m,t,1-m-t) for m in (0.2,0.35,0.5,0.65) for t in (0.1,0.2,0.3) if m+t<0.9]
+  def hit(data,w):
+   return sum(((x[0]+w[0]*x[1]+w[1]*x[2]+w[2]*(2*x[3]-1))>=0)==(x[4]=='yes') for x in data)
+  winner=max(candidates,key=lambda w:hit(train,w))
+  if hit(test,winner)>=hit(test,baseline)+3:return winner
+ except Exception as ex:print("ADAPTIVE WEIGHTS",repr(ex),flush=True)
+ return baseline
+
 def record_observation(ticker,now,spot,target,direction,market):
  try:
   c=connect();q=c.cursor()
@@ -297,8 +314,10 @@ def cycle():
     # Reduce reliance on short-term momentum if it has started reversing.
     momentum_weight=0.22 if reversal else 0.50
     # Future movement estimate is independent of the current strike distance.
+    weights=adaptive_weights() if db_ready else (0.50,0.25,0.25)
+    momentum_weight=weights[0]*(0.44 if reversal else 1.0)
     future_move=expected_move*(momentum_weight*momentum_signal+
-                               0.25*trend_signal+0.25*pattern_signal)
+                               weights[1]*trend_signal+weights[2]*pattern_signal)
     projected_finish=spot+future_move
     forecast=(projected_finish-target)/expected_move
     direction="UP" if forecast>=0 else "DOWN"
