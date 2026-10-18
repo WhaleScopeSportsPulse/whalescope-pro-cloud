@@ -77,7 +77,19 @@ def cycle():
    ms=fetch(BASE+"markets?series_ticker=KXBTC15M&status=open&limit=100").get("markets",[])
    if not ms:
     ms=fetch(BASE+"markets?series_ticker=KXBTC15M&limit=200").get("markets",[])
-   ms=[m for m in ms if stamp(m.get("close_time") or m.get("expiration_time") or "")>now and m.get("status") not in ("closed","settled","finalized")]
+   # Kalshi may omit close_time in list responses; inspect the event/market detail before discarding.
+   if not ms:
+    events=fetch(BASE+"events?series_ticker=KXBTC15M&with_nested_markets=true&limit=100").get("events",[])
+    ms=[m for ev in events for m in ev.get("markets",[])]
+   candidates=[]
+   for item in ms:
+    if item.get("status") in ("closed","settled","finalized"):continue
+    if not item.get("close_time") and not item.get("expiration_time"):
+     try:item=fetch(BASE+"markets/"+urllib.parse.quote(item["ticker"],safe="")).get("market",item)
+     except Exception as ex:print("MARKET DETAIL",repr(ex),flush=True)
+    close_at=stamp(item.get("close_time") or item.get("expiration_time") or "")
+    if close_at>now:candidates.append(item)
+   ms=candidates
    ms.sort(key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
    if not ms:raise RuntimeError("No open BTC 15-minute market")
    m=ms[0];ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
