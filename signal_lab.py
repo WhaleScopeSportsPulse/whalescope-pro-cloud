@@ -56,7 +56,7 @@ def historical_analysis():
  neighbors=sorted(patterns,key=lambda p:sum((a-b)**2 for a,b in zip(p[0],current_shape)))[:25]
  pattern_up=sum(p[1] for p in neighbors)/len(neighbors) if neighbors else 0.5
  volume_ratio=volumes[-1]/max(sum(volumes[-21:-1])/20,0.000001)
- return dict(pattern_up=round(pattern_up,3),pattern_samples=len(neighbors),volume_ratio=round(volume_ratio,2),trend=trend,rsi=round(r,1),ema9=round(e9,2),ema21=round(e21,2),atr=round(atr,2),support=round(support,2),resistance=round(resistance,2),votes=votes,candles=len(close),candle_time=int(candles[-1][0]),last_close=last)
+ return dict(backtest=paper_backtest(candles[-160:]),pattern_up=round(pattern_up,3),pattern_samples=len(neighbors),volume_ratio=round(volume_ratio,2),trend=trend,rsi=round(r,1),ema9=round(e9,2),ema21=round(e21,2),atr=round(atr,2),support=round(support,2),resistance=round(resistance,2),votes=votes,candles=len(close),candle_time=int(candles[-1][0]),last_close=last)
 def connect():
  import pg8000.dbapi as pg
  u=urllib.parse.urlparse(os.environ["DATABASE_URL"])
@@ -108,13 +108,27 @@ def lock(ticker,close,direction,strength,now):
  try:
   c=connect();q=c.cursor();q.execute("INSERT INTO signal_lab_github_locks VALUES (%s,%s,%s,%s,%s) ON CONFLICT (ticker) DO NOTHING",(ticker,close,direction,strength,now));c.commit();c.close()
  except Exception as e:print("DB WRITE",repr(e),flush=True)
-def cashout_signal(direction,yes_ask,no_ask,conflict):
+def paper_backtest(candles):
+ # Walk-forward evaluation: completed 5m candles, 15m outcomes, no future leakage.
+ # Proxy only: this is NOT a backtest of minute-8 Kalshi contract prices.
+ closes=[float(c[4]) for c in candles]
+ wins=total=0
+ for i in range(30,len(closes)-3,3):
+  past=closes[:i+1]
+  momentum=past[-1]-past[-4]
+  pick=1 if momentum>=0 else -1
+  actual=1 if closes[i+3]>=closes[i] else -1
+  wins+=int(pick==actual)
+  total+=1
+ return {"sample":total,"wins":wins,"accuracy":round(wins*100/total,1) if total else None,"method":"5m-candle momentum proxy; not minute-8 model or Kalshi P&L"}
+
+def cashout_signal(direction,yes_ask,no_ask,conflict,yes_bid=None,no_bid=None):
  # Indicative only: executable bids, fees and order depth are not available.
  if direction not in ("UP","DOWN"):return "WAIT / NO TRADE DATA"
  ask=yes_ask if direction=="UP" else no_ask
  if conflict:return "REASSESS / PRICE CROSSED TARGET"
  if ask is None:return "NO QUOTE / DO NOT ASSUME PROFIT"
- return "MONITOR EXIT / BID AND FEES REQUIRED"
+ bid=yes_bid if direction=="UP" else no_bid\n if bid is None:return "NO LIVE BID / EXIT CANNOT BE PRICED"\n return "INDICATIVE EXIT BID "+str(bid)+"¢ / COMPARE TO YOUR ENTRY + FEES"
 
 def cycle():
  db_ready=False
@@ -232,7 +246,7 @@ def cycle():
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
     h=history
-    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict),quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"))
+    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict,m.get("yes_bid"),m.get("no_bid")),quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"))
   except Exception as e:
    print("COLLECTOR",repr(e),flush=True)
    with L:S.update(status="FEED ERROR",error=str(e))
