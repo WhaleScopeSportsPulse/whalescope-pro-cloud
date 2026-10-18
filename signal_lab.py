@@ -120,7 +120,7 @@ def model_audit():
 def record_observation(ticker,now,spot,target,direction,market):
  try:
   c=connect();q=c.cursor()
-  q.execute("INSERT INTO signal_lab_observations(ts,ticker,up_bid,down_bid,btc,reference,direction,entry_signal,up_ask,down_ask) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(now,ticker,market.get("yes_bid"),market.get("no_bid"),spot,target,direction,"OBSERVE",market.get("yes_ask"),market.get("no_ask")))
+  q.execute("INSERT INTO signal_lab_observations(ts,ticker,up_bid,down_bid,btc,reference,direction,entry_signal,up_ask,down_ask) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ticker,ts) DO NOTHING",(now,ticker,market.get("yes_bid_dollars"),market.get("no_bid_dollars"),spot,target,direction,"OBSERVE",market.get("yes_ask_dollars"),market.get("no_ask_dollars")))
   c.commit();c.close()
  except Exception as ex:print("OBSERVATION TRACK",repr(ex),flush=True)
 def track(ticker,close,direction,strength,now,price,yes_ask,no_ask):
