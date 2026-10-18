@@ -90,7 +90,7 @@ def record_baseline(ticker,leader,predicted,move,distance,now):
 def baseline_report():
  try:
   c=connect();q=c.cursor()
-  q.execute("SELECT b.leader,b.predicted,e.result FROM signal_lab_baseline_v1 b JOIN signal_lab_eval_v1 e ON b.ticker=e.ticker WHERE e.result IN ('yes','no') AND b.recorded_at >= %s",(1792347712,))
+  q.execute("SELECT b.leader,b.predicted,e.result FROM signal_lab_baseline_v1 b JOIN signal_lab_eval_v1 e ON b.ticker=e.ticker WHERE e.result IN ('yes','no') AND b.recorded_at >= %s",(1792359837,))
   rows=q.fetchall();c.close()
   n=len(rows)
   if not n:return {"graded":0,"model_accuracy":None,"current_leader_accuracy":None,"different_picks":0}
@@ -159,7 +159,7 @@ def verify():
     q.execute("UPDATE signal_lab_eval_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL",(result,now,ticker))
     c.commit()
    except Exception as e:print("GRADE",ticker,repr(e),flush=True)
-  q.execute("SELECT direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s",(1792347712,))
+  q.execute("SELECT direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s",(1792359837,))
   rows=q.fetchall()
   graded=[(d,r) for d,r in rows if r in ("yes","no") and d in ("UP","DOWN")]
   wins=sum((d=="UP" and r=="yes") or (d=="DOWN" and r=="no") for d,r in graded)
@@ -168,7 +168,7 @@ def verify():
   q.execute("SELECT direction,result,strength,reference_price FROM signal_lab_eval_v1 WHERE result IN ('yes','no') ORDER BY close_ts DESC LIMIT 100")
   audit=q.fetchall()
   mistakes=[{"direction":d,"actual":r,"reason":("MIXED SIGNALS" if "MIXED" in (st or "") else "REVERSAL RISK" if "REVERSAL" in (st or "") else "OTHER / UNDETERMINED")} for d,r,st,price in audit if (d=="UP")!=(r=="yes")]
-  q.execute("SELECT ticker,direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s ORDER BY close_ts DESC LIMIT 15",(1792347712,))
+  q.execute("SELECT ticker,direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s ORDER BY close_ts DESC LIMIT 15",(1792359837,))
   recent=[{"ticker":t,"pick":d,"result":r or "PENDING"} for t,d,r in q.fetchall()]
   perf={"graded":len(graded),"wins":wins,"losses":len(graded)-wins,"skips":skips,"pending":sum(r is None for d,r in rows),"accuracy":round(100*wins/len(graded),1) if graded else None,"last":recent,"mistake_audit":{"sample":len(audit),"mistakes":len(mistakes),"recent_reasons":mistakes[:5]}}
   perf["model_audit"]=model_audit()
@@ -257,10 +257,10 @@ def cycle():
     # An exchange OHLC minute is only a reference estimate, not CF BRTI.
     raw=fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1")
     key=next(k for k in raw["result"] if k!="last")
-    minute=close-960
+    minute=close-900
     bars=[bar for bar in raw["result"][key] if int(bar[0])==minute]
     if not bars:raise RuntimeError("Estimated opening reference unavailable")
-    target=float(bars[0][5])
+    target=float(bars[0][5]) # Kraken minute VWAP; experimental, NOT CF BRTI
     m["estimated_reference"]=True
     print("ESTIMATED REFERENCE",ticker,target,flush=True)
    target=float(target)
