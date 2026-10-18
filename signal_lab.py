@@ -249,9 +249,11 @@ def cycle():
     reversal=(p120 is not None and (spot-p30)*(spot-p120)<0 and
               abs(spot-p30)>threshold*0.5)
     trend_weight=0.15 if reversal else 0.30
-    forecast=distance+0.55*momentum_signal+trend_weight*trend_signal+0.35*(historical.get("pattern_up",0.5)-0.5)*2
+    # Cap target-distance influence; heuristic pending historical validation.
+    distance_signal=max(-0.75,min(0.75,distance))
+    forecast=distance_signal+0.85*momentum_signal+trend_weight*trend_signal+0.35*(historical.get("pattern_up",0.5)-0.5)*2
     direction="UP" if forecast>=0 else "DOWN"
-    agreement=(distance*momentum_signal>0 and distance*trend_signal>0 and not reversal)
+    agreement=(distance_signal*momentum_signal>0 and distance_signal*trend_signal>0 and not reversal)
     strength=("MULTI-FACTOR AGREEMENT / UNCALIBRATED" if agreement else
               "REVERSAL RISK / UNCALIBRATED" if reversal else
               "MIXED SIGNALS / LOW CONFIDENCE")
