@@ -237,17 +237,15 @@ def cycle():
    if target is None:
     # Preserve the feed and log actionable diagnostics; never fabricate a strike.
     print("TARGET MISSING",ticker,"fields",list(m.keys()),"rules",str(m.get("rules_primary") or "")[:300],flush=True)
-    # Keep market prices and observations alive even without an official BRTI reference.
-    prices={}
-    for name in ("kraken","coinbase","bitstamp"):
-     try:prices[name]=btc(name)
-     except Exception as ex:print("SPOT",name,repr(ex),flush=True)
-    if prices:
-     spot=prices.get("kraken",next(iter(prices.values())))
-     if db_ready and now%10==0:record_observation(ticker,now,spot,None,"WAIT",m)
-     with L:S.update(status="REFERENCE UNAVAILABLE",error="Official BRTI opening average not supplied by Kalshi API",ticker=ticker,btc=spot,target=None,remaining=left,locked="ANALYZING",strength="Official settlement reference unavailable",quotes=prices,updated=now,up_ask=m.get("yes_ask_dollars"),down_ask=m.get("no_ask_dollars"))
-    time.sleep(1)
-    continue
+    # An exchange OHLC minute is only a reference estimate, not CF BRTI.
+    raw=fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1")
+    key=next(k for k in raw["result"] if k!="last")
+    minute=close-960
+    bars=[bar for bar in raw["result"][key] if int(bar[0])==minute]
+    if not bars:raise RuntimeError("Estimated opening reference unavailable")
+    target=float(bars[0][5])
+    m["estimated_reference"]=True
+    print("ESTIMATED REFERENCE",ticker,target,flush=True)
    target=float(target)
    with ThreadPoolExecutor(max_workers=3) as pool:
     fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
@@ -326,10 +324,11 @@ def cycle():
     last_verify=now
     verify()
    if db_ready and now%10==0:record_observation(ticker,now,spot,target,direction,m)
+   if m.get("estimated_reference"):strength="ESTIMATED KRAKEN REFERENCE / NOT OFFICIAL BRTI"
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
     h=history
-    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict,m.get("yes_bid"),m.get("no_bid")),quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"),up_bid=m.get("yes_bid"),down_bid=m.get("no_bid"))
+    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=bool(m.get("estimated_reference")),conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict,m.get("yes_bid"),m.get("no_bid")),quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"),up_bid=m.get("yes_bid"),down_bid=m.get("no_bid"))
   except Exception as e:
    print("COLLECTOR",repr(e),flush=True)
    try:
