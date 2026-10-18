@@ -69,6 +69,7 @@ def cycle():
  try:
   setup()
   db_ready=True
+  print("DB SETUP OK",flush=True)
  except Exception as e:print("DB SETUP",repr(e),flush=True)
  while True:
   try:
@@ -91,7 +92,14 @@ def cycle():
     if close_at>now:candidates.append(item)
    ms=candidates
    ms.sort(key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
-   if not ms:raise RuntimeError("No open BTC 15-minute market")
+   if not ms:
+    print("MARKET DIAGNOSTIC empty candidates; checking API series and event listing",flush=True)
+    for endpoint in ("series/KXBTC15M","events?series_ticker=KXBTC15M&limit=3","markets?series_ticker=KXBTC15M&limit=3"):
+     try:
+      data=fetch(BASE+endpoint)
+      print("MARKET DIAGNOSTIC",endpoint,json.dumps(data,default=str)[:1800],flush=True)
+     except Exception as ex:print("MARKET DIAGNOSTIC ERROR",endpoint,repr(ex),flush=True)
+    raise RuntimeError("No open BTC 15-minute market")
    m=ms[0];ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
    target=m.get("floor_strike")
    if target is None:target=m.get("strike_price")
