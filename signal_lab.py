@@ -234,7 +234,7 @@ def cycle():
     last_ticker=ticker
    record=record_cache
    if record:direction,strength,locked_at=record
-   elif left<=420 and ready and historical:
+   elif left<=540 and ready and historical:
     # Compare live short-term momentum with historical candle trend, RSI, and volatility.
     # No fabricated probability: disagreement is explicitly flagged.
     # Forecast settlement against the actual strike, not just the current trend.
