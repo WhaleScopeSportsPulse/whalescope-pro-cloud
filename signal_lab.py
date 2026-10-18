@@ -66,6 +66,7 @@ def setup():
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_github_locks(ticker TEXT PRIMARY KEY, close_ts BIGINT, locked TEXT, strength TEXT, locked_at BIGINT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_eval_v1(ticker TEXT PRIMARY KEY, close_ts BIGINT NOT NULL, direction TEXT NOT NULL, strength TEXT, locked_at BIGINT NOT NULL, reference_price DOUBLE PRECISION, market_yes_ask INTEGER, market_no_ask INTEGER, result TEXT, graded_at BIGINT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_features_v2(ticker TEXT PRIMARY KEY, forecast DOUBLE PRECISION, distance DOUBLE PRECISION, momentum DOUBLE PRECISION, trend DOUBLE PRECISION, pattern DOUBLE PRECISION, result TEXT)")
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_baseline_v1(ticker TEXT PRIMARY KEY, leader TEXT NOT NULL, predicted TEXT NOT NULL, projected_move DOUBLE PRECISION, strike_distance DOUBLE PRECISION, recorded_at BIGINT NOT NULL)")
  c.commit();c.close()
 def track_features(ticker,forecast,distance,momentum,trend,pattern):
  try:
@@ -73,6 +74,23 @@ def track_features(ticker,forecast,distance,momentum,trend,pattern):
   q.execute("INSERT INTO signal_lab_features_v2(ticker,forecast,distance,momentum,trend,pattern) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,forecast,distance,momentum,trend,pattern))
   c.commit();c.close()
  except Exception as ex:print("FEATURE TRACK",repr(ex),flush=True)
+def record_baseline(ticker,leader,predicted,move,distance,now):
+ try:
+  c=connect();q=c.cursor()
+  q.execute("INSERT INTO signal_lab_baseline_v1(ticker,leader,predicted,projected_move,strike_distance,recorded_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,leader,predicted,move,distance,now))
+  c.commit();c.close()
+ except Exception as ex:print("BASELINE TRACK",repr(ex),flush=True)
+def baseline_report():
+ try:
+  c=connect();q=c.cursor()
+  q.execute("SELECT b.leader,b.predicted,e.result FROM signal_lab_baseline_v1 b JOIN signal_lab_eval_v1 e ON b.ticker=e.ticker WHERE e.result IN ('yes','no') AND b.recorded_at >= %s",(1792347712,))
+  rows=q.fetchall();c.close()
+  n=len(rows)
+  if not n:return {"graded":0,"model_accuracy":None,"current_leader_accuracy":None,"different_picks":0}
+  model=sum((p=="UP")==(r=="yes") for leader,p,r in rows)
+  baseline=sum((leader=="UP")==(r=="yes") for leader,p,r in rows)
+  return {"graded":n,"model_accuracy":round(100*model/n,1),"current_leader_accuracy":round(100*baseline/n,1),"different_picks":sum(leader!=p for leader,p,r in rows)}
+ except Exception as ex:return {"error":str(ex)[:120]}
 def model_audit():
  # Out-of-sample chronological evaluation of recorded live decisions.
  # Never train and evaluate on the same settled round.
@@ -124,6 +142,7 @@ def verify():
   recent=[{"ticker":t,"pick":d,"result":r or "PENDING"} for t,d,r in q.fetchall()]
   perf={"graded":len(graded),"wins":wins,"losses":len(graded)-wins,"skips":skips,"pending":sum(r is None for d,r in rows),"accuracy":round(100*wins/len(graded),1) if graded else None,"last":recent,"mistake_audit":{"sample":len(audit),"mistakes":len(mistakes),"recent_reasons":mistakes[:5]}}
   perf["model_audit"]=model_audit()
+  perf["leader_comparison"]=baseline_report()
   with L:S["performance"]=perf
   c.close()
  except Exception as e:print("VERIFY",repr(e),flush=True)
@@ -267,6 +286,7 @@ def cycle():
      lock(ticker,close,direction,strength,now)
      track(ticker,close,direction,strength,now,spot,m.get("yes_ask"),m.get("no_ask"))
      track_features(ticker,forecast,distance,momentum_signal,trend_signal,historical.get("pattern_up",0.5))
+     record_baseline(ticker,current_leader,direction,future_move,spot-target,now)
     record_cache=(direction,strength,now)
    elif left>780:direction,strength,locked_at="ANALYZING","STUDYING FIRST 2 MINUTES",None
    else:direction,strength,locked_at="ANALYZING","LOADING HISTORICAL CANDLES / MOMENTUM",None
