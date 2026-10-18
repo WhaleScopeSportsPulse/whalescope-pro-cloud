@@ -62,10 +62,13 @@ def lock(ticker,close,direction,strength,now):
   c=connect();q=c.cursor();q.execute("INSERT INTO signal_lab_github_locks VALUES (%s,%s,%s,%s,%s) ON CONFLICT (ticker) DO NOTHING",(ticker,close,direction,strength,now));c.commit();c.close()
  except Exception as e:print("DB WRITE",repr(e),flush=True)
 def cycle():
+ db_ready=False
  last_verify=0
  last_ticker=None
  record_cache=None
- try:setup()
+ try:
+  setup()
+  db_ready=True
  except Exception as e:print("DB SETUP",repr(e),flush=True)
  while True:
   try:
@@ -103,7 +106,7 @@ def cycle():
     if p120 is not None:score=0.45*v30+0.35*v60+0.20*(spot-p120)
    threshold=max(8.0,spread*1.5,spot*0.00008)
    if ticker!=last_ticker:
-    record_cache=saved(ticker)
+    record_cache=saved(ticker) if db_ready else None
     last_ticker=ticker
    record=record_cache
    if record:direction,strength,locked_at=record
@@ -113,18 +116,19 @@ def cycle():
      direction="UP" if score>0 else "DOWN"
      strength="MOMENTUM LEAN / NOT VERIFIED"
     locked_at=now
-    lock(ticker,close,direction,strength,now)
-    track(ticker,close,direction,strength,now,spot,m.get("yes_ask"),m.get("no_ask"))
+    if db_ready:
+     lock(ticker,close,direction,strength,now)
+     track(ticker,close,direction,strength,now,spot,m.get("yes_ask"),m.get("no_ask"))
     record_cache=(direction,strength,now)
    elif left<=720:direction,strength,locked_at="ANALYZING","COLLECTING 60 SECONDS OF HISTORY",None
    else:direction,strength,locked_at="ANALYZING","WAITING FOR 3-MINUTE LOCK",None
-   if now-last_verify>=60:
+   if db_ready and now-last_verify>=60:
     last_verify=now
     verify()
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
     h=history
-    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,conflict=conflict,quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"))
+    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,conflict=conflict,quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"))
   except Exception as e:
    print("COLLECTOR",repr(e),flush=True)
    with L:S.update(status="FEED ERROR",error=str(e))
@@ -134,7 +138,7 @@ HTML='''<!doctype html><html><head><meta name="viewport" content="width=device-w
 </style></head><body><main class="wrap"><header class="head"><span class="logo">ϟ SIGNAL LAB</span><span class="pill" id="status">CONNECTING</span></header><section class="card"><div class="between"><span class="label">LOCKED AT 3 MINUTES</span><span class="pill" id="phase">ANALYZING</span></div><div id="signal" class="signal warn">WAIT</div><div id="strength" class="muted">Waiting for exchange data</div><div id="notice" class="notice" hidden></div></section><section class="card"><div class="between"><span class="label">CURRENT ROUND</span><span class="timer" id="timer">--:--</span></div><div class="bar"><div class="fill" id="progress"></div></div><div class="grid"><div><div class="label">KALSHI TARGET</div><div class="price" id="target">—</div><div class="muted small">Fixed at round start</div></div><div><div class="label">NOW <span id="arrow"></span></div><div class="price" id="now">—</div><div class="muted small">Updates ~1 second</div></div></div><div class="diff" id="diff">—</div><div class="label">BTC LIVE MOVEMENT</div><svg viewBox="0 0 600 170" preserveAspectRatio="none"><path id="reference" fill="none" stroke="#8c9fb7" stroke-dasharray="6 6"/><path id="chart" fill="none" stroke="#32ddb0" stroke-width="3" stroke-linejoin="round"/></svg><div class="between muted small"><span id="up">UP buy —</span><span id="down">DOWN buy —</span></div></section><section class="card"><div class="label">VERIFIED PERFORMANCE · OFFICIAL SETTLEMENT</div><div class="grid" style="margin-top:15px"><div><div class="label">GRADED SIGNALS</div><div class="price" id="graded">0</div></div><div><div class="label">ACCURACY</div><div class="price" id="accuracy">—</div></div></div><p class="muted small" id="scorecard">No verified results yet</p><div id="recent" class="muted small"></div><p class="muted small">Accuracy excludes WAIT rounds and pending settlements. No results are invented. Experimental model; historical performance does not guarantee future outcomes.</p></section><details><summary>Exchange checks</summary><p class="muted small" id="quotes">Waiting for data</p></details><details><summary>Diagnostics</summary><p class="muted small" id="ticker"></p><p class="muted small">Experimental forecast, not a calibrated probability. Kalshi's settlement index may differ from exchange spot prices.</p></details></main><script>
 const e=id=>document.getElementById(id),money=n=>'$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});let last=null;
 function chart(a,t){if(!a||a.length<2)return;let v=a.map(p=>p[1]),low=Math.min(t,...v),high=Math.max(t,...v),pad=Math.max((high-low)*.15,2);low-=pad;high+=pad;let y=z=>160-(z-low)/(high-low)*150,x=i=>i*600/(v.length-1);e('chart').setAttribute('d',v.map((z,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+y(z).toFixed(1)).join(' '));e('reference').setAttribute('d','M0 '+y(t)+' L600 '+y(t))}
-async function refresh(){try{let r=await fetch('/api?'+Date.now(),{cache:'no-store'}),d=await r.json();e('status').textContent=d.status;if(d.btc==null||d.target==null)return;e('target').textContent=money(d.target);e('now').textContent=money(d.btc);let dif=d.btc-d.target;e('diff').textContent=(dif>=0?'▲ +$':'▼ -$')+Math.abs(dif).toFixed(2)+(dif>=0?' above target':' below target');e('diff').className='diff '+(dif>=0?'up':'down');if(last!==null){let z=d.btc-last;e('arrow').textContent=z>0?'▲':z<0?'▼':'•';e('arrow').className=z>0?'up':z<0?'down':'muted'}last=d.btc;let s=d.remaining;e('timer').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');e('progress').style.width=(100-s/9)+'%';e('signal').textContent=d.locked;e('signal').className='signal '+(d.locked==='UP'?'up':d.locked==='DOWN'?'down':'warn');e('strength').textContent=d.strength;e('phase').textContent=d.locked==='ANALYZING'?'ANALYZING':'LOCKED';e('up').textContent='UP buy '+(d.up_ask??'—')+'¢';e('down').textContent='DOWN buy '+(d.down_ask??'—')+'¢';e('quotes').textContent=Object.entries(d.quotes||{}).map(([k,v])=>k+': '+money(v)).join(' · ');e('ticker').textContent=d.ticker;let p=d.performance||{};e('graded').textContent=p.graded??0;e('accuracy').textContent=p.accuracy==null?'—':p.accuracy+'%';e('scorecard').textContent=(p.wins??0)+' wins · '+(p.losses??0)+' losses · '+(p.skips??0)+' skips · '+(p.pending??0)+' pending';e('recent').textContent=(p.last||[]).slice(0,5).map(x=>x.pick+' → '+x.result).join(' | ');e('notice').hidden=!d.conflict;e('notice').textContent=d.conflict?'⚠ Price has crossed to the opposite side of the locked signal. Reliability reduced.':'';chart(d.history,d.target)}catch(err){e('status').textContent='RECONNECTING'}}
+async function refresh(){try{let r=await fetch('/api?'+Date.now(),{cache:'no-store'}),d=await r.json();e('status').textContent=d.status;if(d.btc==null||d.target==null)return;e('target').textContent=money(d.target);e('now').textContent=money(d.btc);let dif=d.btc-d.target;e('diff').textContent=(dif>=0?'▲ +$':'▼ -$')+Math.abs(dif).toFixed(2)+(dif>=0?' above target':' below target');e('diff').className='diff '+(dif>=0?'up':'down');if(last!==null){let z=d.btc-last;e('arrow').textContent=z>0?'▲':z<0?'▼':'•';e('arrow').className=z>0?'up':z<0?'down':'muted'}last=d.btc;let s=d.remaining;e('timer').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');e('progress').style.width=(100-s/9)+'%';e('signal').textContent=d.locked;e('signal').className='signal '+(d.locked==='UP'?'up':d.locked==='DOWN'?'down':'warn');e('strength').textContent=d.strength;e('phase').textContent=d.locked==='ANALYZING'?'ANALYZING':'LOCKED';e('up').textContent='UP buy '+(d.up_ask??'—')+'¢';e('down').textContent='DOWN buy '+(d.down_ask??'—')+'¢';e('quotes').textContent=Object.entries(d.quotes||{}).map(([k,v])=>k+': '+money(v)).join(' · ');e('ticker').textContent=d.ticker;let p=d.performance||{};e('graded').textContent=p.graded??0;e('accuracy').textContent=p.accuracy==null?'—':p.accuracy+'%';e('scorecard').textContent=(d.tracking_online?'':'⚠ Database tracking offline · ')+(p.wins??0)+' wins · '+(p.losses??0)+' losses · '+(p.skips??0)+' skips · '+(p.pending??0)+' pending';e('recent').textContent=(p.last||[]).slice(0,5).map(x=>x.pick+' → '+x.result).join(' | ');e('notice').hidden=!d.conflict;e('notice').textContent=d.conflict?'⚠ Price has crossed to the opposite side of the locked signal. Reliability reduced.':'';chart(d.history,d.target)}catch(err){e('status').textContent='RECONNECTING'}}
 refresh();setInterval(refresh,1000)
 </script></body></html>'''
 class Handler(BaseHTTPRequestHandler):
