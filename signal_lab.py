@@ -110,6 +110,12 @@ def model_audit():
   baseline=(0.55,0.3,0.35)
   return {"status":"SHADOW TEST","samples":len(rows),"holdout":len(test),"candidate_weights":selected,"candidate_accuracy":round(100*accuracy(test,selected),1),"baseline_accuracy":round(100*accuracy(test,baseline),1),"note":"Shadow evaluation only; live weights unchanged"}
  except Exception as ex:return {"status":"ERROR","error":str(ex)[:120]}
+def record_observation(ticker,now,spot,target,direction,market):
+ try:
+  c=connect();q=c.cursor()
+  q.execute("INSERT INTO signal_lab_observations(ts,ticker,up_bid,down_bid,btc,reference,direction,entry_signal,up_ask,down_ask) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(now,ticker,market.get("yes_bid"),market.get("no_bid"),spot,target,direction,"OBSERVE",market.get("yes_ask"),market.get("no_ask")))
+  c.commit();c.close()
+ except Exception as ex:print("OBSERVATION TRACK",repr(ex),flush=True)
 def track(ticker,close,direction,strength,now,price,yes_ask,no_ask):
  try:
   c=connect();q=c.cursor()
@@ -302,6 +308,7 @@ def cycle():
    if db_ready and now-last_verify>=60:
     last_verify=now
     verify()
+   if db_ready and now%10==0:record_observation(ticker,now,spot,target,direction,m)
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
     h=history
