@@ -73,8 +73,11 @@ def cycle():
  while True:
   try:
    now=int(time.time())
+   # Query open markets first; retry unfiltered when Kalshi status indexing lags.
    ms=fetch(BASE+"markets?series_ticker=KXBTC15M&status=open&limit=100").get("markets",[])
-   ms=[m for m in ms if stamp(m.get("close_time") or m.get("expiration_time") or "")>now]
+   if not ms:
+    ms=fetch(BASE+"markets?series_ticker=KXBTC15M&limit=200").get("markets",[])
+   ms=[m for m in ms if stamp(m.get("close_time") or m.get("expiration_time") or "")>now and m.get("status") not in ("closed","settled","finalized")]
    ms.sort(key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
    if not ms:raise RuntimeError("No open BTC 15-minute market")
    m=ms[0];ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
@@ -111,10 +114,9 @@ def cycle():
    record=record_cache
    if record:direction,strength,locked_at=record
    elif left<=720 and ready:
-    if abs(score)<threshold:direction,strength="WAIT","NO CLEAR MOMENTUM"
-    else:
-     direction="UP" if score>0 else "DOWN"
-     strength="MOMENTUM LEAN / NOT VERIFIED"
+    # Forecast a direction even for weak momentum, while marking it low confidence.
+    direction="UP" if (score if abs(score)>1e-9 else spot-target)>=0 else "DOWN"
+    strength="LOW CONFIDENCE / WEAK MOMENTUM" if abs(score)<threshold else "MOMENTUM LEAN / NOT VERIFIED"
     locked_at=now
     if db_ready:
      lock(ticker,close,direction,strength,now)
