@@ -128,7 +128,9 @@ def cashout_signal(direction,yes_ask,no_ask,conflict,yes_bid=None,no_bid=None):
  ask=yes_ask if direction=="UP" else no_ask
  if conflict:return "REASSESS / PRICE CROSSED TARGET"
  if ask is None:return "NO QUOTE / DO NOT ASSUME PROFIT"
- bid=yes_bid if direction=="UP" else no_bid\n if bid is None:return "NO LIVE BID / EXIT CANNOT BE PRICED"\n return "INDICATIVE EXIT BID "+str(bid)+"¢ / COMPARE TO YOUR ENTRY + FEES"
+ bid=yes_bid if direction=="UP" else no_bid
+ if bid is None:return "NO LIVE BID / EXIT CANNOT BE PRICED"
+ return "INDICATIVE EXIT BID "+str(bid)+"¢ / COMPARE TO YOUR ENTRY + FEES"
 
 def cycle():
  db_ready=False
