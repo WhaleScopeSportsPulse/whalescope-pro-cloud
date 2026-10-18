@@ -215,7 +215,16 @@ def cycle():
    m=ms[0];ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
    target=m.get("floor_strike")
    if target is None:target=m.get("strike_price")
-   if target is None:raise RuntimeError("Kalshi target missing")
+   if target is None:
+    # List responses may omit strike fields. Fetch the canonical market object.
+    detail=fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{})
+    m={**m,**{k:v for k,v in detail.items() if v is not None}}
+    target=m.get("floor_strike")
+    if target is None:target=m.get("strike_price")
+   if target is None:
+    # Preserve the feed and log actionable diagnostics; never fabricate a strike.
+    print("TARGET MISSING",ticker,"fields",list(m.keys()),"rules",str(m.get("rules_primary") or "")[:300],flush=True)
+    raise RuntimeError("Kalshi strike missing in market list AND market detail: "+ticker)
    target=float(target)
    with ThreadPoolExecutor(max_workers=3) as pool:
     fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
