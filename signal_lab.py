@@ -230,7 +230,17 @@ def cycle():
    if target is None:
     # Preserve the feed and log actionable diagnostics; never fabricate a strike.
     print("TARGET MISSING",ticker,"fields",list(m.keys()),"rules",str(m.get("rules_primary") or "")[:300],flush=True)
-    raise RuntimeError("Kalshi strike missing in market list AND market detail: "+ticker)
+    # Keep market prices and observations alive even without an official BRTI reference.
+    prices={}
+    for name in ("kraken","coinbase","bitstamp"):
+     try:prices[name]=btc(name)
+     except Exception as ex:print("SPOT",name,repr(ex),flush=True)
+    if prices:
+     spot=prices.get("kraken",next(iter(prices.values())))
+     if db_ready and now%10==0:record_observation(ticker,now,spot,None,"WAIT",m)
+     with L:S.update(status="REFERENCE UNAVAILABLE",error="Official BRTI opening average not supplied by Kalshi API",ticker=ticker,btc=spot,target=None,remaining=left,locked="ANALYZING",strength="Official settlement reference unavailable",quotes=prices,updated=now,up_ask=m.get("yes_ask_dollars"),down_ask=m.get("no_ask_dollars"))
+    time.sleep(1)
+    continue
    target=float(target)
    with ThreadPoolExecutor(max_workers=3) as pool:
     fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
