@@ -53,7 +53,14 @@ def historical_analysis():
   patterns.append((shape,future))
  current_scale=max(sum(high[-j]-low[-j] for j in (1,2,3))/3,1)
  current_shape=[(close[-4+j]-close[-4])/current_scale for j in range(1,4)]
- neighbors=sorted(patterns,key=lambda p:sum((a-b)**2 for a,b in zip(p[0],current_shape)))[:25]
+ # Prevent near-identical overlapping historical windows from dominating the vote.
+ ranked=sorted(enumerate(patterns),key=lambda ip:sum((a-b)**2 for a,b in zip(ip[1][0],current_shape)))
+ chosen=[]
+ for idx,p in ranked:
+  if all(abs(idx-j)>=3 for j,_ in chosen):
+   chosen.append((idx,p))
+  if len(chosen)>=25:break
+ neighbors=[p for _,p in chosen]
  pattern_up=sum(p[1] for p in neighbors)/len(neighbors) if neighbors else 0.5
  volume_ratio=volumes[-1]/max(sum(volumes[-21:-1])/20,0.000001)
  return dict(backtest=paper_backtest(candles[-160:]),pattern_up=round(pattern_up,3),pattern_samples=len(neighbors),volume_ratio=round(volume_ratio,2),trend=trend,rsi=round(r,1),ema9=round(e9,2),ema21=round(e21,2),atr=round(atr,2),support=round(support,2),resistance=round(resistance,2),votes=votes,candles=len(close),candle_time=int(candles[-1][0]),last_close=last)
