@@ -174,26 +174,25 @@ def cycle():
  while True:
   try:
    now=int(time.time())
-   # Query open markets first; retry unfiltered when Kalshi status indexing lags.
-   ms=fetch(BASE+"markets?series_ticker=KXBTC15M&status=open&limit=100").get("markets",[])
-   if not ms:
-    ms=fetch(BASE+"markets?series_ticker=KXBTC15M&limit=200").get("markets",[])
-   # Kalshi may omit close_time in list responses; inspect the event/market detail before discarding.
-   if not ms:
-    events=fetch(BASE+"events?series_ticker=KXBTC15M&with_nested_markets=true&limit=100").get("events",[])
-    ms=[m for ev in events for m in ev.get("markets",[])]
+   # Search the paginated market list for the currently trading 15-minute round.
+   # Kalshi's first page may contain only future contracts, so do not treat it as exhaustive.
    candidates=[]
-   for item in ms:
-    if item.get("status") in ("closed","settled","finalized"):continue
-    if not item.get("close_time") and not item.get("expiration_time"):
-     try:item=fetch(BASE+"markets/"+urllib.parse.quote(item["ticker"],safe="")).get("market",item)
-     except Exception as ex:print("MARKET DETAIL",repr(ex),flush=True)
-    close_at=stamp(item.get("close_time") or item.get("expiration_time") or "")
-    if close_at>now:candidates.append(item)
-   ms=candidates
-   ms.sort(key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
-   if not ms:
-    raise RuntimeError("No currently available BTC 15-minute market from Kalshi")
+   cursor=""
+   for page in range(12):
+    url=BASE+"markets?series_ticker=KXBTC15M&limit=200"
+    if cursor:url+="&cursor="+urllib.parse.quote(cursor,safe="")
+    response=fetch(url)
+    for item in response.get("markets",[]):
+     if item.get("status") in ("closed","settled","finalized"):continue
+     start=stamp(item.get("open_time") or "")
+     end=stamp(item.get("close_time") or item.get("expiration_time") or "")
+     if start<=now<end and end-now<=1200:
+      candidates.append(item)
+    if candidates:break
+    cursor=response.get("cursor") or ""
+    if not cursor:break
+   ms=sorted(candidates,key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
+   if not ms:raise RuntimeError("Kalshi did not return a currently trading BTC 15-minute market")
    m=ms[0];ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
    target=m.get("floor_strike")
    if target is None:target=m.get("strike_price")
