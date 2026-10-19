@@ -337,6 +337,9 @@ def cycle():
                         (direction=="DOWN" and momentum_signal<0 and (trend_signal<0 or pattern_signal<0))))
     if raw_flip and not reversal_evidence:
      direction=current_leader
+     # Keep the recorded forecast aligned with the actual locked decision.
+     # Previously the training feature could say DOWN while the lock said UP.
+     forecast=abs(forecast) if direction=="UP" else -abs(forecast)
     predicts_flip=(direction!=current_leader)
     agreement=(momentum_signal*trend_signal>0 and
                momentum_signal*pattern_signal>0 and not reversal)
