@@ -1,5 +1,6 @@
 import os,time,json,threading,datetime,urllib.request,urllib.parse,math
 import signal_lab_exit
+import signal_lab_depth
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 BASE="https://external-api.kalshi.com/trade-api/v2/"
@@ -221,6 +222,8 @@ def cycle():
  record_cache=None
  historical=None
  historical_checked=0
+ depth_checked=0
+ depth_data=None
  try:
   setup()
   db_ready=True
@@ -299,6 +302,11 @@ def cycle():
     except Exception as ex:
      historical=None
      print('HISTORICAL ERROR',repr(ex),flush=True)
+   # Collect exchange depth for shadow research only. Never alter live picks
+   # until recorded, out-of-sample settlement tests show a benefit.
+   if now-depth_checked>=30:
+    depth_checked=now
+    depth_data=signal_lab_depth.snapshot()
    spread=max(prices.values())-min(prices.values())
    ready=p30 is not None and p60 is not None and len(history)>=15
    score=0.0
@@ -370,7 +378,7 @@ def cycle():
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
     h=history
-    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=bool(m.get("estimated_reference")),conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict,m.get("yes_bid"),m.get("no_bid")),quotes=prices,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"),up_bid=m.get("yes_bid"),down_bid=m.get("no_bid"))
+    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=bool(m.get("estimated_reference")),conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict,m.get("yes_bid"),m.get("no_bid")),quotes=prices,depth_research=depth_data,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"),up_bid=m.get("yes_bid"),down_bid=m.get("no_bid"))
   except Exception as e:
    print("COLLECTOR",repr(e),flush=True)
    try:
