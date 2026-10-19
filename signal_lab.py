@@ -321,8 +321,16 @@ def cycle():
     projected_finish=spot+future_move
     forecast=(projected_finish-target)/expected_move
     direction="UP" if forecast>=0 else "DOWN"
-    # Record whether the model actually predicts a reversal of the current leader.
+    # A reversal requires more evidence than a marginal projection across the strike.
+    # Otherwise minor spot noise can repeatedly trigger speculative contrarian picks.
     current_leader="UP" if spot>=target else "DOWN"
+    raw_flip=(direction!=current_leader)
+    reversal_margin=max(threshold, expected_move*0.20)
+    reversal_evidence=(abs(projected_finish-target)>=reversal_margin and
+                       ((direction=="UP" and momentum_signal>0 and (trend_signal>0 or pattern_signal>0)) or
+                        (direction=="DOWN" and momentum_signal<0 and (trend_signal<0 or pattern_signal<0))))
+    if raw_flip and not reversal_evidence:
+     direction=current_leader
     predicts_flip=(direction!=current_leader)
     agreement=(momentum_signal*trend_signal>0 and
                momentum_signal*pattern_signal>0 and not reversal)
