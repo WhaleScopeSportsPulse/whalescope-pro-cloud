@@ -1,4 +1,5 @@
 import os,time,json,threading,datetime,urllib.request,urllib.parse,math
+import signal_lab_exit
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 BASE="https://external-api.kalshi.com/trade-api/v2/"
@@ -406,6 +407,7 @@ import signal_lab_membership as membership
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   path=self.path.split("?")[0]
+  if signal_lab_exit.get(self,path):return
   if membership.get(self,path):return
   if path=="/api":
    if os.getenv("SIGNAL_LAB_PREMIUM_ENABLED")=="true" and membership.ready() and not membership.allowed(membership.session(self)):
