@@ -259,7 +259,13 @@ def cycle():
     key=next(k for k in raw["result"] if k!="last")
     minute=close-900
     bars=[bar for bar in raw["result"][key] if int(bar[0])==minute]
-    if not bars:raise RuntimeError("Estimated opening reference unavailable")
+    # A 1m candle is only available after the exchange publishes it. At round
+    # rollover use the preceding completed minute until the opening bar exists.
+    if not bars:
+     previous=[bar for bar in raw["result"][key] if int(bar[0])<minute]
+     if not previous:raise RuntimeError("Estimated opening reference unavailable")
+     bars=[previous[-1]]
+     m["reference_previous_minute"]=True
     target=float(bars[0][5]) # Kraken minute VWAP; experimental, NOT CF BRTI
     m["estimated_reference"]=True
     print("ESTIMATED REFERENCE",ticker,target,flush=True)
