@@ -130,8 +130,13 @@ def adaptive_weights():
   candidates=[(m,t,1-m-t) for m in (0.2,0.35,0.5,0.65) for t in (0.1,0.2,0.3) if m+t<0.9]
   def hit(data,w):
    return sum(((x[0]+w[0]*x[1]+w[1]*x[2]+w[2]*(2*x[3]-1))>=0)==(x[4]=='yes') for x in data)
-  winner=max(candidates,key=lambda w:hit(train,w))
-  if hit(test,winner)>=hit(test,baseline)+3:return winner
+  # Evaluate the existing baseline as a candidate and require a genuine
+  # improvement in both chronological training and untouched holdout.
+  # This prevents switching on a small, lucky holdout sample.
+  winner=max(candidates,key=lambda w:(hit(train,w),-sum(abs(a-b) for a,b in zip(w,baseline))))
+  train_gain=hit(train,winner)-hit(train,baseline)
+  test_gain=hit(test,winner)-hit(test,baseline)
+  if train_gain>=3 and test_gain>=4 and hit(test,winner)>=24:return winner
  except Exception as ex:print("ADAPTIVE WEIGHTS",repr(ex),flush=True)
  return baseline
 
