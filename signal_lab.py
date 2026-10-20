@@ -442,5 +442,17 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   if not membership.post(self,self.path.split("?")[0]):self.send_error(404)
  def log_message(self,*args):pass
+def brti_research_worker():
+ # Shadow-only reference feed; never overwrite the model's target with spot.
+ try:
+  from signal_lab_brti import run_forever
+  def got(value):
+   with L:
+    S["brti_reference"]={"source_ms":value["source_ms"],"value":value["value"],"trailing_60s":value["trailing_60s"],"trailing_samples":value["trailing_samples"],"final_minute_average":value["final_minute_average"],"final_minute_samples":value["final_minute_samples"],"final_window_end_ms":value["final_window_end_ms"]}
+  run_forever(got,lambda message:print(message,flush=True))
+ except Exception as ex:print("BRTI RESEARCH",repr(ex),flush=True)
+
+if os.environ.get("SIGNAL_LAB_BRTI_RESEARCH")=="1":
+ threading.Thread(target=brti_research_worker,daemon=True).start()
 threading.Thread(target=cycle,daemon=True).start()
 ThreadingHTTPServer(("0.0.0.0",int(os.getenv("PORT","10000"))),Handler).serve_forever()
