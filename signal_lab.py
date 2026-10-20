@@ -276,6 +276,14 @@ def cycle():
     target=m.get("floor_strike")
     if target is None:target=m.get("strike_price")
    if db_ready:record_market_rules(ticker,now,close,m)
+   # Directional 15-minute contracts do not publish a numeric strike.
+   # Record official BRTI observations independently of the model.
+   with L:
+    latest_brti=S.get("brti_reference")
+   if latest_brti and now*1000-int(latest_brti.get("source_ms") or 0)<120000:
+    with L:S["brti_feed_status"]="LIVE"
+   else:
+    with L:S["brti_feed_status"]="STALE OR UNAVAILABLE"
    if target is None:
     # Never substitute an exchange VWAP for Kalshi's contract strike.
     # A guessed target invalidates both predictions and settlement research.
