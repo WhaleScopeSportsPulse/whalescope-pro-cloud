@@ -76,7 +76,15 @@ def setup():
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_eval_v1(ticker TEXT PRIMARY KEY, close_ts BIGINT NOT NULL, direction TEXT NOT NULL, strength TEXT, locked_at BIGINT NOT NULL, reference_price DOUBLE PRECISION, market_yes_ask INTEGER, market_no_ask INTEGER, result TEXT, graded_at BIGINT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_features_v2(ticker TEXT PRIMARY KEY, forecast DOUBLE PRECISION, distance DOUBLE PRECISION, momentum DOUBLE PRECISION, trend DOUBLE PRECISION, pattern DOUBLE PRECISION, result TEXT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_baseline_v1(ticker TEXT PRIMARY KEY, leader TEXT NOT NULL, predicted TEXT NOT NULL, projected_move DOUBLE PRECISION, strike_distance DOUBLE PRECISION, recorded_at BIGINT NOT NULL)")
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_research_snapshots_v1(ticker TEXT NOT NULL, observed_at BIGINT NOT NULL, close_ts BIGINT NOT NULL, spot DOUBLE PRECISION NOT NULL, strike DOUBLE PRECISION NOT NULL, seconds_left INTEGER NOT NULL, predicted TEXT, kraken DOUBLE PRECISION, coinbase DOUBLE PRECISION, bitstamp DOUBLE PRECISION, yes_bid TEXT, yes_ask TEXT, no_bid TEXT, no_ask TEXT, PRIMARY KEY(ticker,observed_at))")
  c.commit();c.close()
+def research_snapshot(ticker,now,close,spot,target,left,direction,prices,market):
+ # Raw timestamped research samples; never use these to grade a round before settlement.
+ try:
+  c=connect();q=c.cursor()
+  q.execute("INSERT INTO signal_lab_research_snapshots_v1(ticker,observed_at,close_ts,spot,strike,seconds_left,predicted,kraken,coinbase,bitstamp,yes_bid,yes_ask,no_bid,no_ask) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker,observed_at) DO NOTHING",(ticker,now,close,spot,target,left,direction,prices.get("kraken"),prices.get("coinbase"),prices.get("bitstamp"),str(market.get("yes_bid_dollars") or market.get("yes_bid") or ""),str(market.get("yes_ask_dollars") or market.get("yes_ask") or ""),str(market.get("no_bid_dollars") or market.get("no_bid") or ""),str(market.get("no_ask_dollars") or market.get("no_ask") or "")))
+  c.commit();c.close()
+ except Exception as ex:print("RESEARCH SNAPSHOT",repr(ex),flush=True)
 def track_features(ticker,forecast,distance,momentum,trend,pattern):
  try:
   c=connect();q=c.cursor()
@@ -357,6 +365,7 @@ def cycle():
     last_verify=now
     verify()
    if db_ready and now%10==0:record_observation(ticker,now,spot,target,direction,m)
+   if db_ready and now%10==0:research_snapshot(ticker,now,close,spot,target,left,direction,prices,m)
    if m.get("estimated_reference"):strength="ESTIMATED KRAKEN REFERENCE / NOT OFFICIAL BRTI"
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
