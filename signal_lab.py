@@ -261,23 +261,9 @@ def cycle():
     target=m.get("floor_strike")
     if target is None:target=m.get("strike_price")
    if target is None:
-    # Preserve the feed and log actionable diagnostics; never fabricate a strike.
-    print("TARGET MISSING",ticker,"fields",list(m.keys()),"rules",str(m.get("rules_primary") or "")[:300],flush=True)
-    # An exchange OHLC minute is only a reference estimate, not CF BRTI.
-    raw=fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1")
-    key=next(k for k in raw["result"] if k!="last")
-    minute=close-900
-    bars=[bar for bar in raw["result"][key] if int(bar[0])==minute]
-    # A 1m candle is only available after the exchange publishes it. At round
-    # rollover use the preceding completed minute until the opening bar exists.
-    if not bars:
-     previous=[bar for bar in raw["result"][key] if int(bar[0])<minute]
-     if not previous:raise RuntimeError("Estimated opening reference unavailable")
-     bars=[previous[-1]]
-     m["reference_previous_minute"]=True
-    target=float(bars[0][5]) # Kraken minute VWAP; experimental, NOT CF BRTI
-    m["estimated_reference"]=True
-    print("ESTIMATED REFERENCE",ticker,target,flush=True)
+    # Never substitute an exchange VWAP for Kalshi's contract strike.
+    # A guessed target invalidates both predictions and settlement research.
+    raise RuntimeError("UNVERIFIED_KALSHI_TARGET: missing canonical strike for "+ticker)
    target=float(target)
    with ThreadPoolExecutor(max_workers=3) as pool:
     fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
