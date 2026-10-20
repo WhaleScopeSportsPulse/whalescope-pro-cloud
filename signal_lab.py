@@ -77,7 +77,14 @@ def setup():
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_features_v2(ticker TEXT PRIMARY KEY, forecast DOUBLE PRECISION, distance DOUBLE PRECISION, momentum DOUBLE PRECISION, trend DOUBLE PRECISION, pattern DOUBLE PRECISION, result TEXT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_baseline_v1(ticker TEXT PRIMARY KEY, leader TEXT NOT NULL, predicted TEXT NOT NULL, projected_move DOUBLE PRECISION, strike_distance DOUBLE PRECISION, recorded_at BIGINT NOT NULL)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_research_snapshots_v1(ticker TEXT NOT NULL, observed_at BIGINT NOT NULL, close_ts BIGINT NOT NULL, spot DOUBLE PRECISION NOT NULL, strike DOUBLE PRECISION NOT NULL, seconds_left INTEGER NOT NULL, predicted TEXT, kraken DOUBLE PRECISION, coinbase DOUBLE PRECISION, bitstamp DOUBLE PRECISION, yes_bid TEXT, yes_ask TEXT, no_bid TEXT, no_ask TEXT, PRIMARY KEY(ticker,observed_at))")
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_market_rules_v1(ticker TEXT PRIMARY KEY, observed_at BIGINT NOT NULL, close_ts BIGINT NOT NULL, rules_primary TEXT, rules_secondary TEXT, market_type TEXT)")
  c.commit();c.close()
+def record_market_rules(ticker,now,close,market):
+ try:
+  c=connect();q=c.cursor()
+  q.execute("INSERT INTO signal_lab_market_rules_v1(ticker,observed_at,close_ts,rules_primary,rules_secondary,market_type) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,now,close,str(market.get("rules_primary") or ""),str(market.get("rules_secondary") or ""),str(market.get("market_type") or "")))
+  c.commit();c.close()
+ except Exception as ex:print("MARKET RULES",repr(ex),flush=True)
 def research_snapshot(ticker,now,close,spot,target,left,direction,prices,market):
  # Raw timestamped research samples; never use these to grade a round before settlement.
  try:
@@ -268,6 +275,7 @@ def cycle():
     m={**m,**{k:v for k,v in detail.items() if v is not None}}
     target=m.get("floor_strike")
     if target is None:target=m.get("strike_price")
+   if db_ready:record_market_rules(ticker,now,close,m)
    if target is None:
     # Never substitute an exchange VWAP for Kalshi's contract strike.
     # A guessed target invalidates both predictions and settlement research.
