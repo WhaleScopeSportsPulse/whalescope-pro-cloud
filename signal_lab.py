@@ -181,7 +181,7 @@ def verify():
     q.execute("UPDATE signal_lab_eval_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL",(result,now,ticker))
     c.commit()
    except Exception as e:print("GRADE",ticker,repr(e),flush=True)
-  q.execute("SELECT direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s",(int(os.getenv("SIGNAL_LAB_SCORECARD_EPOCH","1792430840")),))
+  q.execute("SELECT direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s",(int(os.getenv("SIGNAL_LAB_SCORECARD_EPOCH","1792460700")),))
   rows=q.fetchall()
   graded=[(d,r) for d,r in rows if r in ("yes","no") and d in ("UP","DOWN")]
   wins=sum((d=="UP" and r=="yes") or (d=="DOWN" and r=="no") for d,r in graded)
@@ -190,9 +190,9 @@ def verify():
   q.execute("SELECT direction,result,strength,reference_price FROM signal_lab_eval_v1 WHERE result IN ('yes','no') ORDER BY close_ts DESC LIMIT 100")
   audit=q.fetchall()
   mistakes=[{"direction":d,"actual":r,"reason":("MIXED SIGNALS" if "MIXED" in (st or "") else "REVERSAL RISK" if "REVERSAL" in (st or "") else "OTHER / UNDETERMINED")} for d,r,st,price in audit if (d=="UP")!=(r=="yes")]
-  q.execute("SELECT ticker,direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s ORDER BY close_ts DESC LIMIT 15",(int(os.getenv("SIGNAL_LAB_SCORECARD_EPOCH","1792430840")),))
+  q.execute("SELECT ticker,direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s ORDER BY close_ts DESC LIMIT 15",(int(os.getenv("SIGNAL_LAB_SCORECARD_EPOCH","1792460700")),))
   recent=[{"ticker":t,"pick":d,"result":r or "PENDING"} for t,d,r in q.fetchall()]
-  perf={"scorecard_since":int(os.getenv("SIGNAL_LAB_SCORECARD_EPOCH","1792430840")),"graded":len(graded),"wins":wins,"losses":len(graded)-wins,"skips":skips,"pending":sum(r is None for d,r in rows),"accuracy":round(100*wins/len(graded),1) if graded else None,"last":recent,"mistake_audit":{"sample":len(audit),"mistakes":len(mistakes),"recent_reasons":mistakes[:5]}}
+  perf={"scorecard_since":int(os.getenv("SIGNAL_LAB_SCORECARD_EPOCH","1792460700")),"graded":len(graded),"wins":wins,"losses":len(graded)-wins,"skips":skips,"pending":sum(r is None for d,r in rows),"accuracy":round(100*wins/len(graded),1) if graded else None,"last":recent,"mistake_audit":{"sample":len(audit),"mistakes":len(mistakes),"recent_reasons":mistakes[:5]}}
   perf["model_audit"]=model_audit()
   perf["leader_comparison"]=baseline_report()
   with L:S["performance"]=perf
