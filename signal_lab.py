@@ -285,9 +285,14 @@ def cycle():
    else:
     with L:S["brti_feed_status"]="STALE OR UNAVAILABLE"
    if target is None:
-    # Never substitute an exchange VWAP for Kalshi's contract strike.
-    # A guessed target invalidates both predictions and settlement research.
-    raise RuntimeError("UNVERIFIED_KALSHI_TARGET: missing canonical strike for "+ticker)
+    # 15-minute directional markets use the BRTI 60-second average
+    # immediately preceding the round start, not a fixed strike.
+    opening_ms=(close-900)*1000
+    with L:
+     official=S.get("brti_opening_refs",{}).get(opening_ms)
+    if official is None:
+     raise RuntimeError("UNVERIFIED_KALSHI_TARGET: awaiting complete BRTI opening window for "+ticker)
+    target=official
    target=float(target)
    with ThreadPoolExecutor(max_workers=3) as pool:
     fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
@@ -546,10 +551,26 @@ def brti_research_worker():
   def got(value):
    with L:
     S["brti_reference"]={"source_ms":value["source_ms"],"value":value["value"],"trailing_60s":value["trailing_60s"],"trailing_samples":value["trailing_samples"],"final_minute_average":value["final_minute_average"],"final_minute_samples":value["final_minute_samples"],"final_window_end_ms":value["final_window_end_ms"]}
+    # Only accept the complete BRTI minute ending exactly at a
+    # quarter-hour boundary. Never approximate it with spot prices.
+    end=value.get("final_window_end_ms")
+    avg=value.get("final_minute_average")
+    samples=value.get("final_minute_samples") or 0
+    if end is not None and avg is not None and samples>=50:
+     boundary=int(end)
+     if boundary%900000==0 and abs(value["source_ms"]-boundary)<3000:
+      refs=S.setdefault("brti_opening_refs",{})
+      refs[boundary]=float(avg)
+      for k in list(refs):
+       if k<value["source_ms"]-7200000:del refs[k]
+      print("BRTI OPENING WINDOW VERIFIED",boundary,"samples",samples,flush=True)
   run_forever(got,lambda message:print(message,flush=True))
  except Exception as ex:print("BRTI RESEARCH",repr(ex),flush=True)
 
-if os.environ.get("SIGNAL_LAB_BRTI_RESEARCH")=="1":
+if os.environ.get("KALSHI_API_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PEM"):
+ print("BRTI WORKER STARTING",flush=True)
  threading.Thread(target=brti_research_worker,daemon=True).start()
+else:
+ print("BRTI WORKER DISABLED: Kalshi credentials not configured",flush=True)
 threading.Thread(target=cycle,daemon=True).start()
 ThreadingHTTPServer(("0.0.0.0",int(os.getenv("PORT","10000"))),Handler).serve_forever()
