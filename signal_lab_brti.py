@@ -13,7 +13,7 @@ def auth_headers(key_id, private_pem, timestamp_ms=None):
     if not key_id or not private_pem:
         raise ValueError("Kalshi API key ID and RSA private key are required")
     ts = str(timestamp_ms if timestamp_ms is not None else int(time.time()*1000))
-    key = serialization.load_pem_private_key(private_pem.replace("\\n", "\n").encode(), password=None)
+    key = serialization.load_pem_private_key(private_pem.encode(), password=None)
     signature = key.sign((ts+"GET"+PATH).encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.DIGEST_LENGTH),hashes.SHA256())
     return {"KALSHI-ACCESS-KEY":key_id,"KALSHI-ACCESS-TIMESTAMP":ts,"KALSHI-ACCESS-SIGNATURE":base64.b64encode(signature).decode()}
 
