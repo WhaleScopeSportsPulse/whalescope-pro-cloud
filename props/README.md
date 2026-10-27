@@ -59,6 +59,26 @@ and `updated_at`. Writes go through Neon's HTTPS SQL endpoint (`https://<host>/s
 no driver is needed and they work where port 5432 is blocked. `DATABASE_URL` must be a
 Neon connection string.
 
+### Pick log
+
+After each board save, the same refresh logs qualifying picks to `props.picks_log` (created on
+first use) and grades finished ones. A prop side is logged once per `market_id` + `side` when its
+game starts within the next 2 hours and:
+
+- L5, L10 and L20 have full samples (5, 10, 20 games),
+- that side's hit rate is at least 0.70 in all three,
+- `0 < price < 1`, and `score` = lowest of the three rates − price is at least 0.10.
+
+`l5`/`l10`/`l20` and `price` are for the logged side (under rate = 1 − over rate). The start time
+and game come from ESPN's scoreboard, because Kalshi's `occurrence_datetime` runs about three
+hours after the real start. `stat`, `athlete_id` and `event_id` are kept for grading.
+
+Once ESPN marks the game final, the pick is graded from the player's ESPN game log: `hit` or
+`miss`, `push` when the stat equals the line, `void` when the player didn't play (no log entry
+6 hours after the start, or zero minutes in basketball) or the game was postponed or canceled.
+`actual` is the stat value. A failure here is logged and retried on the next refresh; it never
+affects `props_board`.
+
 ## Supported props
 
 NBA/WNBA: points, rebounds, assists, threes, steals, blocks, stocks, PRA, P+R, P+A, R+A, FTM ·

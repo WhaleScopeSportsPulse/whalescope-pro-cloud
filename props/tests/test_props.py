@@ -1,7 +1,9 @@
 import unittest
 from unittest import mock
 
-from props import espn, kalshi, service, underdog
+import datetime as dt
+
+from props import espn, kalshi, picks, service, underdog
 from props.espn import Game, parse_gamelog
 from props.hitrate import hit_rates, window
 from props.stats import get, resolve
@@ -150,6 +152,96 @@ class Underdog(unittest.TestCase):
                 mock.patch.object(kalshi, "fetch_props", return_value=[]):
             props, ok, errors = service.collect_sources()
         self.assertEqual((props, ok, list(errors)), ([], ["kalshi"], ["underdog"]))
+
+
+def board_row(r5=0.8, r10=0.8, r20=0.75, g=(5, 10, 20), over=0.55, under=0.47, **kw):
+    rates = dict(zip(("l5", "l10", "l20"), (r5, r10, r20)))
+    row = {"source": "kalshi", "league": "nba", "stat": "points", "stat_label": "Points", "player": "Jalen Brunson",
+           "team": "NY", "team_id": "18", "opponent": "DET", "opponent_id": "8", "line": 24.5,
+           "over_price": over, "under_price": under, "start_time": "2026-10-28T03:00:00Z",
+           "market_id": "KXNBAPTS-X-NYKJBRUNSON11-25", "athlete_id": "3934672", "error": None}
+    row.update({k: {"games": n, "rate": rates[k]} for k, n in zip(("l5", "l10", "l20"), g)})
+    row.update(kw)
+    return row
+
+
+NOW = dt.datetime(2026, 10, 27, 23, 0, tzinfo=dt.timezone.utc)
+
+
+def event(start, state="pre", name="STATUS_SCHEDULED", completed=False, teams=("18", "8"), eid="401909878"):
+    return {"id": eid, "start": start, "state": state, "name": name, "completed": completed, "teams": set(teams)}
+
+
+class Picks(unittest.TestCase):
+    def test_rule(self):
+        q = picks.qualifies(board_row(), "over")
+        self.assertEqual((q["l5"], q["l20"], q["price"], q["score"]), (0.8, 0.75, 0.55, 0.2))
+        self.assertIsNone(picks.qualifies(board_row(), "under"))            # under rates 0.2-0.25
+        self.assertIsNone(picks.qualifies(board_row(g=(5, 10, 19)), "over"))  # L20 not full
+        self.assertIsNone(picks.qualifies(board_row(r20=0.69), "over"))      # one window under 0.70
+        self.assertIsNone(picks.qualifies(board_row(over=0.66), "over"))     # score 0.09
+        self.assertIsNotNone(picks.qualifies(board_row(over=0.65), "over"))  # score 0.10
+        self.assertIsNone(picks.qualifies(board_row(over=None), "over"))
+        self.assertIsNone(picks.qualifies(board_row(over=1.0), "over"))
+        u = picks.qualifies(board_row(r5=0.2, r10=0.1, r20=0.25, under=0.6), "under")
+        self.assertEqual((u["l5"], u["l10"], u["l20"], u["score"]), (0.8, 0.9, 0.75, 0.15))
+
+    def test_select_uses_espn_start(self):
+        # Kalshi lists 03:00Z, ESPN tips at 00:00Z: within 2h of 23:00Z only by ESPN's time.
+        tip = dt.datetime(2026, 10, 28, 0, 0, tzinfo=dt.timezone.utc)
+        with mock.patch.object(picks, "scoreboard", return_value=[event(tip)]):
+            out = picks.select([board_row()], NOW)
+            late = picks.select([board_row()], NOW - dt.timedelta(hours=1, minutes=1))
+        self.assertEqual([(p["side"], p["event_id"], p["start_time"]) for p in out],
+                         [("over", "401909878", "2026-10-28T00:00:00+00:00")])
+        self.assertEqual(late, [])
+        with mock.patch.object(picks, "scoreboard", return_value=[event(tip, state="in")]):
+            self.assertEqual(picks.select([board_row()], NOW), [])  # already started
+
+    def test_select_skips_rows_without_ids(self):
+        with mock.patch.object(picks, "scoreboard", return_value=[]) as sb:
+            self.assertEqual(picks.select([board_row(market_id=None), board_row(athlete_id=None),
+                                           board_row(error="player not found on ESPN roster")], NOW), [])
+        sb.assert_not_called()
+
+    def test_grade_value(self):
+        self.assertEqual(picks.grade_value(27, 24.5, "over"), "hit")
+        self.assertEqual(picks.grade_value(20, 24.5, "over"), "miss")
+        self.assertEqual(picks.grade_value(20, 24.5, "under"), "hit")
+        self.assertEqual(picks.grade_value(25, 25, "under"), "push")
+
+    def test_grade(self):
+        tip = dt.datetime(2026, 10, 27, 0, 0, tzinfo=dt.timezone.utc)
+        pending = [{"id": i, "league": "nba", "stat": "points", "athlete_id": "1", "event_id": str(i), "line": 24.5,
+                    "side": "over", "start": str(tip.timestamp())} for i in (1, 2, 3, 4, 5)]
+        board = [event(tip, "post", "STATUS_FINAL", True, eid="1"), event(tip, "post", "STATUS_FINAL", True, eid="2"),
+                 event(tip, "post", "STATUS_POSTPONED", False, eid="3"), event(tip, "in", eid="4"),
+                 event(tip, "post", "STATUS_FINAL", True, eid="5")]
+        games = {"1": (True, 30.0), "2": (False, None), "5": (False, None)}
+        updates = []
+
+        def query(sql, params=None, url=None):
+            if sql.startswith("SELECT"):
+                return pending
+            updates.append(params)
+            return []
+
+        with mock.patch.object(picks.db, "query", side_effect=query), \
+                mock.patch.object(picks, "scoreboard", return_value=board), \
+                mock.patch.object(picks, "_player_game", side_effect=lambda l, a, s, e: games[e]):
+            counts = picks.grade(tip + dt.timedelta(hours=7))
+            self.assertEqual(counts, {"hit": 1, "void": 3})
+            self.assertEqual(sorted((u[2], u[0], u[1]) for u in updates),
+                             [(1, "hit", 30.0), (2, "void", None), (3, "void", None), (5, "void", None)])
+            updates.clear()
+            # Final but missing from the log only 3h after tip: wait for ESPN to update.
+            self.assertEqual(picks.grade(tip + dt.timedelta(hours=3)), {"hit": 1, "void": 1})
+
+    def test_no_gamelog_this_season_is_not_played(self):
+        err = picks.net.urllib.error.HTTPError("u", 404, "Not Found", None, None)
+        with mock.patch.object(picks.espn, "current_season", return_value=2027), \
+                mock.patch.object(picks.net, "get_json", side_effect=err):
+            self.assertEqual(picks._player_game("nhl", "1", "shots", "9"), (False, None))
 
 
 class Gamelog(unittest.TestCase):

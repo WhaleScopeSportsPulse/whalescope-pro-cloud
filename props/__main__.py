@@ -4,6 +4,7 @@
     python -m props slate --league nba --window l10 --min-rate 0.7
     python -m props player --league nba --name "Zach LaVine" --stat points --line 24.5 --opponent SA
     python -m props load                       # one refresh, written to props.props_board ($DATABASE_URL)
+                                               # and qualifying picks logged/graded in props.picks_log
 """
 from __future__ import annotations
 
@@ -149,6 +150,14 @@ def main(argv=None) -> int:
             rows = service.enrich(props)
         n = db.save(rows, ok, a.league)
         print(f"saved {n} props to props.props_board ({', '.join(ok)})")
+        if not a.from_json:
+            from . import picks
+            try:
+                logged, graded = picks.run(rows)
+                print(f"picks_log: {logged} new picks, graded {graded or 'none'}")
+            except Exception as e:  # the board is saved; picks retry next refresh
+                logging.exception("picks_log failed")
+                print(f"picks_log failed: {e}", file=sys.stderr)
     return 0
 
 

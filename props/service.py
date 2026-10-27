@@ -131,6 +131,11 @@ class Snapshot:
             except Exception as e:
                 log.exception("saving props_board failed")
                 self.error = f"db: {e}"
+            from . import picks
+            try:
+                picks.run(rows)
+            except Exception:
+                log.exception("picks_log failed")
 
     def kick(self) -> None:
         self._kick.set()
