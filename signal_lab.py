@@ -9,6 +9,10 @@ L=threading.RLock()
 def fetch(url):
  req=urllib.request.Request(url,headers={"User-Agent":"SignalLab/21","Accept":"application/json"})
  with urllib.request.urlopen(req,timeout=8) as r:return json.load(r)
+def cents(x):
+ # Kalshi quotes arrive as dollar strings ("0.4300"); store whole cents.
+ try:return None if x is None else int(round(float(x)*100))
+ except (TypeError,ValueError):return None
 def stamp(x):
  try:return int(datetime.datetime.fromisoformat(x.replace("Z","+00:00")).timestamp())
  except:return 0
@@ -76,6 +80,9 @@ def setup():
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_eval_v1(ticker TEXT PRIMARY KEY, close_ts BIGINT NOT NULL, direction TEXT NOT NULL, strength TEXT, locked_at BIGINT NOT NULL, reference_price DOUBLE PRECISION, market_yes_ask INTEGER, market_no_ask INTEGER, result TEXT, graded_at BIGINT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_features_v2(ticker TEXT PRIMARY KEY, forecast DOUBLE PRECISION, distance DOUBLE PRECISION, momentum DOUBLE PRECISION, trend DOUBLE PRECISION, pattern DOUBLE PRECISION, result TEXT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_baseline_v1(ticker TEXT PRIMARY KEY, leader TEXT NOT NULL, predicted TEXT NOT NULL, projected_move DOUBLE PRECISION, strike_distance DOUBLE PRECISION, recorded_at BIGINT NOT NULL)")
+ # Independent "bet the current leader" baseline: own price, strike, ask and grade.
+ for col in ("close_ts BIGINT","btc DOUBLE PRECISION","target DOUBLE PRECISION","leader_ask INTEGER","method TEXT","result TEXT","graded_at BIGINT"):
+  q.execute("ALTER TABLE signal_lab_baseline_v1 ADD COLUMN IF NOT EXISTS "+col)
  c.commit();c.close()
 def track_features(ticker,forecast,distance,momentum,trend,pattern):
  try:
@@ -83,22 +90,27 @@ def track_features(ticker,forecast,distance,momentum,trend,pattern):
   q.execute("INSERT INTO signal_lab_features_v2(ticker,forecast,distance,momentum,trend,pattern) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,forecast,distance,momentum,trend,pattern))
   c.commit();c.close()
  except Exception as ex:print("FEATURE TRACK",repr(ex),flush=True)
-def record_baseline(ticker,leader,predicted,move,distance,now):
+def record_baseline(ticker,close,spot,target,leader_ask,now):
+ # Bets whichever side is currently winning; never reads the model's pick.
+ leader="UP" if spot>=target else "DOWN"
  try:
   c=connect();q=c.cursor()
-  q.execute("INSERT INTO signal_lab_baseline_v1(ticker,leader,predicted,projected_move,strike_distance,recorded_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,leader,predicted,move,distance,now))
+  q.execute("INSERT INTO signal_lab_baseline_v1(ticker,leader,predicted,strike_distance,recorded_at,close_ts,btc,target,leader_ask,method) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,leader,leader,spot-target,now,close,spot,target,leader_ask,"current_leader_v2"))
   c.commit();c.close()
- except Exception as ex:print("BASELINE TRACK",repr(ex),flush=True)
+  return True
+ except Exception as ex:print("BASELINE TRACK",repr(ex),flush=True);return False
 def baseline_report():
  try:
   c=connect();q=c.cursor()
-  q.execute("SELECT b.leader,b.predicted,e.result FROM signal_lab_baseline_v1 b JOIN signal_lab_eval_v1 e ON b.ticker=e.ticker WHERE e.result IN ('yes','no') AND b.recorded_at >= %s",(1792430840,))
+  # Baseline graded on its own result; model pick comes from eval_v1, not the baseline row.
+  q.execute("SELECT b.leader,e.direction,COALESCE(b.result,e.result) FROM signal_lab_baseline_v1 b LEFT JOIN signal_lab_eval_v1 e ON b.ticker=e.ticker WHERE COALESCE(b.result,e.result) IN ('yes','no') AND b.recorded_at >= %s",(1792430840,))
   rows=q.fetchall();c.close()
   n=len(rows)
   if not n:return {"graded":0,"model_accuracy":None,"current_leader_accuracy":None,"different_picks":0}
-  model=sum((p=="UP")==(r=="yes") for leader,p,r in rows)
+  picked=[(leader,p,r) for leader,p,r in rows if p in ("UP","DOWN")]
+  model=sum((p=="UP")==(r=="yes") for leader,p,r in picked)
   baseline=sum((leader=="UP")==(r=="yes") for leader,p,r in rows)
-  return {"graded":n,"model_accuracy":round(100*model/n,1),"current_leader_accuracy":round(100*baseline/n,1),"different_picks":sum(leader!=p for leader,p,r in rows)}
+  return {"graded":n,"model_graded":len(picked),"model_accuracy":round(100*model/len(picked),1) if picked else None,"current_leader_accuracy":round(100*baseline/n,1),"different_picks":sum(leader!=p for leader,p,r in picked)}
  except Exception as ex:return {"error":str(ex)[:120]}
 def model_audit():
  # Out-of-sample chronological evaluation of recorded live decisions.
@@ -156,7 +168,7 @@ def track(ticker,close,direction,strength,now,price,yes_ask,no_ask):
 def verify():
  try:
   c=connect();q=c.cursor();now=int(time.time())
-  q.execute("SELECT ticker FROM signal_lab_eval_v1 WHERE result IS NULL AND close_ts<%s ORDER BY close_ts LIMIT 15",(now-30,))
+  q.execute("SELECT ticker FROM (SELECT ticker,close_ts FROM signal_lab_eval_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_baseline_v1 WHERE result IS NULL AND close_ts<%s) p GROUP BY ticker ORDER BY min(close_ts) LIMIT 15",(now-30,now-30))
   pending=[x[0] for x in q.fetchall()]
   for ticker in pending:
    try:
@@ -164,6 +176,7 @@ def verify():
     result=str(m.get("result") or "").lower()
     if result not in ("yes","no"):continue
     q.execute("UPDATE signal_lab_eval_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL",(result,now,ticker))
+    q.execute("UPDATE signal_lab_baseline_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL AND close_ts IS NOT NULL",(result,now,ticker))
     c.commit()
    except Exception as e:print("GRADE",ticker,repr(e),flush=True)
   q.execute("SELECT direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s",(1792430840,))
@@ -215,9 +228,41 @@ def cashout_signal(direction,yes_ask,no_ask,conflict,yes_bid=None,no_bid=None):
  if bid is None:return "NO LIVE BID / EXIT CANNOT BE PRICED"
  return "INDICATIVE EXIT BID "+str(bid)+"¢ / COMPARE TO YOUR ENTRY + FEES"
 
+OBSERVE_SECONDS=max(3,int(os.getenv("SIGNAL_LAB_OBSERVE_SECONDS","5")))
+def find_market(now):
+ # Search the paginated market list for the currently trading 15-minute round.
+ # Kalshi's first page may contain only future contracts, so do not treat it as exhaustive.
+ candidates=[]
+ cursor=""
+ for page in range(12):
+  url=BASE+"markets?series_ticker=KXBTC15M&status=open&limit=200"
+  if cursor:url+="&cursor="+urllib.parse.quote(cursor,safe="")
+  response=fetch(url)
+  for item in response.get("markets",[]):
+   if item.get("status") in ("closed","settled","finalized"):continue
+   start=stamp(item.get("open_time") or "")
+   end=stamp(item.get("close_time") or item.get("expiration_time") or "")
+   if start<=now<end and end-now<=1200:
+    candidates.append(item)
+  if candidates:break
+  cursor=response.get("cursor") or ""
+  if not cursor:break
+ ms=sorted(candidates,key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
+ if not ms:raise RuntimeError("Kalshi did not return a currently trading BTC 15-minute market")
+ return ms[0]
+verifying=threading.Lock()
+def verify_async():
+ # Grading fetches up to 15 markets; keep it off the 5-second observation loop.
+ if not verifying.acquire(blocking=False):return
+ def run():
+  try:verify()
+  finally:verifying.release()
+ threading.Thread(target=run,daemon=True).start()
 def cycle():
  db_ready=False
  last_verify=0
+ market=None
+ baseline_ticker=None
  last_ticker=None
  record_cache=None
  historical=None
@@ -230,28 +275,18 @@ def cycle():
   print("DB SETUP OK",flush=True)
  except Exception as e:print("DB SETUP",repr(e),flush=True)
  while True:
+  tick=time.time()
   try:
-   now=int(time.time())
-   # Search the paginated market list for the currently trading 15-minute round.
-   # Kalshi's first page may contain only future contracts, so do not treat it as exhaustive.
-   candidates=[]
-   cursor=""
-   for page in range(12):
-    url=BASE+"markets?series_ticker=KXBTC15M&limit=200"
-    if cursor:url+="&cursor="+urllib.parse.quote(cursor,safe="")
-    response=fetch(url)
-    for item in response.get("markets",[]):
-     if item.get("status") in ("closed","settled","finalized"):continue
-     start=stamp(item.get("open_time") or "")
-     end=stamp(item.get("close_time") or item.get("expiration_time") or "")
-     if start<=now<end and end-now<=1200:
-      candidates.append(item)
-    if candidates:break
-    cursor=response.get("cursor") or ""
-    if not cursor:break
-   ms=sorted(candidates,key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
-   if not ms:raise RuntimeError("Kalshi did not return a currently trading BTC 15-minute market")
-   m=ms[0];ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
+   now=int(tick)
+   # Scan the paginated list only at round rollover; within a round poll the one
+   # market for fresh quotes (paginated polling every few seconds caused HTTP 429).
+   if market is None or now>=stamp(market.get("close_time") or market.get("expiration_time") or ""):
+    market=None
+    market=find_market(now)
+   else:
+    detail=fetch(BASE+"markets/"+urllib.parse.quote(market["ticker"],safe="")).get("market",{})
+    market={**market,**{k:v for k,v in detail.items() if v is not None}}
+   m=dict(market);ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
    target=m.get("floor_strike")
    if target is None:target=m.get("strike_price")
    if target is None:
@@ -361,23 +396,27 @@ def cycle():
     locked_at=now
     if db_ready:
      lock(ticker,close,direction,strength,now)
-     track(ticker,close,direction,strength,now,spot,m.get("yes_ask"),m.get("no_ask"))
+     track(ticker,close,direction,strength,now,spot,cents(m.get("yes_ask_dollars")),cents(m.get("no_ask_dollars")))
      track_features(ticker,forecast,distance,momentum_signal,trend_signal,historical.get("pattern_up",0.5))
-     record_baseline(ticker,current_leader,direction,future_move,spot-target,now)
     record_cache=(direction,strength,now)
    elif left>780:direction,strength,locked_at="ANALYZING","STUDYING FIRST 2 MINUTES",None
    else:direction,strength,locked_at="ANALYZING","LOADING HISTORICAL CANDLES / MOMENTUM",None
+   # Leader baseline locks at the same minute-2 point, independent of model readiness.
+   if db_ready and left<=780 and baseline_ticker!=ticker:
+    leader_ask=cents(m.get("yes_ask_dollars") if spot>=target else m.get("no_ask_dollars"))
+    if record_baseline(ticker,close,spot,target,leader_ask,now):baseline_ticker=ticker
    if db_ready and now-last_verify>=60:
     last_verify=now
-    verify()
-   if db_ready and now%10==0:record_observation(ticker,now,spot,target,direction,m)
+    verify_async()
+   if db_ready:record_observation(ticker,now,spot,target,direction,m)
    if m.get("estimated_reference"):strength="ESTIMATED KRAKEN REFERENCE / NOT OFFICIAL BRTI"
    conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
    with L:
     h=history
-    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,close_epoch=close,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=bool(m.get("estimated_reference")),conflict=conflict,cashout=cashout_signal(direction,m.get("yes_ask"),m.get("no_ask"),conflict,m.get("yes_bid"),m.get("no_bid")),quotes=prices,depth_research=depth_data,history=h,updated=now,up_ask=m.get("yes_ask"),down_ask=m.get("no_ask"),up_bid=m.get("yes_bid"),down_bid=m.get("no_bid"))
+    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,close_epoch=close,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=bool(m.get("estimated_reference")),conflict=conflict,cashout=cashout_signal(direction,cents(m.get("yes_ask_dollars")),cents(m.get("no_ask_dollars")),conflict,cents(m.get("yes_bid_dollars")),cents(m.get("no_bid_dollars"))),quotes=prices,depth_research=depth_data,history=h,updated=now,up_ask=cents(m.get("yes_ask_dollars")),down_ask=cents(m.get("no_ask_dollars")),up_bid=cents(m.get("yes_bid_dollars")),down_bid=cents(m.get("no_bid_dollars")))
   except Exception as e:
    print("COLLECTOR",repr(e),flush=True)
+   market=None
    try:
     with ThreadPoolExecutor(max_workers=3) as pool:
      fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
@@ -389,9 +428,9 @@ def cycle():
      S.update(status="MARKET UNAVAILABLE",error=str(e),btc=prices.get("kraken",next(iter(prices.values())) if prices else None),quotes=prices,updated=int(time.time()),locked="ANALYZING",strength="Kalshi market feed unavailable; no prediction",target=None,remaining=None)
    except Exception as spot_ex:
     with L:S.update(status="FEED ERROR",error=str(e)+"; spot: "+str(spot_ex))
-   time.sleep(30 if "429" in str(e) else 14)
-  # Avoid hammering paginated Kalshi markets endpoints; 1s polling caused HTTP 429.
-  time.sleep(8)
+   time.sleep(10 if "429" in str(e) else 14)
+  # One single-market request per tick; sleep only the remainder of the interval.
+  time.sleep(max(0.5,OBSERVE_SECONDS-(time.time()-tick)))
 HTML='''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090e18"><title>Signal Lab</title><style>
 *{box-sizing:border-box}body{margin:0;background:#090e18;color:#eef5ff;font:16px system-ui,sans-serif}.wrap{max-width:760px;margin:auto;padding:22px 18px 70px}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:26px}.logo{font-size:25px;font-weight:900}.pill{background:#243750;border-radius:99px;padding:9px 12px;font-size:12px}.card{background:linear-gradient(140deg,#152641,#101c30);border:1px solid #2b4261;border-radius:24px;padding:23px;margin:16px 0}.label{font-size:12px;font-weight:800;letter-spacing:2px;color:#a4b7d0}.signal{font-size:clamp(65px,17vw,110px);font-weight:900;letter-spacing:-5px;margin:10px 0}.up{color:#2ee0aa}.down{color:#ff6886}.warn{color:#ffc26b}.muted{color:#9fb3cd}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.price{font-size:clamp(24px,6vw,40px);font-weight:850;letter-spacing:-1px;margin:8px 0}.between{display:flex;align-items:center;justify-content:space-between;gap:8px}.timer{font-size:29px;font-weight:850}.bar{height:9px;border-radius:9px;background:#293d56;overflow:hidden;margin:20px 0}.fill{height:100%;width:0;background:linear-gradient(90deg,#42a7f7,#2edcad)}.diff{font-size:22px;font-weight:800;margin:24px 0}.notice{padding:14px;border:1px solid #91673e;border-radius:13px;background:#403020;margin-top:17px}svg{display:block;width:100%;height:170px}details{background:#121f34;border:1px solid #2b4261;border-radius:16px;padding:20px;margin:14px 0}summary{font-weight:750;cursor:pointer}.small{font-size:13px;line-height:1.7}
 body{background:#0b1020!important;color:#e9eefb!important}.wrap{max-width:1180px!important}.card{background:linear-gradient(145deg,#1b2540,#141c30)!important;border:1px solid #303957!important;box-shadow:0 8px 25px #05081444!important}.logo{color:#b49bff!important}.pill{background:#303253!important;color:#a9efcf!important}.label{color:#b5b1da!important}.fill{background:linear-gradient(90deg,#ad8bff,#6ce8bc)!important}.signal.up,.up{color:#6ce8bc!important}.signal.down,.down{color:#ff7e9f!important}.price{color:#f0edff!important}svg{background:linear-gradient(180deg,#23254655,#151c3000);border-radius:12px}details{background:#161e33!important;border-color:#343857!important}@media(min-width:900px){.wrap{padding-top:32px!important}.head{margin-bottom:36px!important}.card{padding:30px!important}}.wrap{max-width:1200px;display:grid;grid-template-columns:2fr 1fr;gap:16px}.head{grid-column:1/-1}.wrap>.card{margin:0}.wrap>.card:nth-of-type(1){grid-column:2;grid-row:2}.wrap>.card:nth-of-type(2){grid-column:1;grid-row:2}.wrap>.card:nth-of-type(3){grid-column:1/-1}.wrap>details{grid-column:1/-1}@media(max-width:700px){.wrap{display:flex;flex-direction:column}}.wrap{grid-template-columns:210px minmax(0,2fr) minmax(0,1fr)!important;gap:16px!important}.sidebar{grid-column:1;grid-row:1/5;background:#121a2e;border:1px solid #303957;border-radius:20px;padding:24px 15px;display:flex;flex-direction:column;gap:12px}.sidebrand{color:#b49bff;font-size:19px;font-weight:900;padding:8px 10px 26px}.sideitem{font-size:14px;color:#a8b3d2;padding:14px;border-radius:12px}.sideitem.active{background:#302957;color:#d9cbff;font-weight:800}.sidefoot{margin-top:auto;color:#7686a8;font-size:11px;line-height:2;padding:12px}.head{grid-column:2/-1!important;grid-row:1!important;margin:0!important;padding:14px 18px;border:1px solid #303957;border-radius:16px;background:#161e33}.wrap>.card:nth-of-type(1){grid-column:3!important;grid-row:2!important}.wrap>.card:nth-of-type(2){grid-column:2!important;grid-row:2!important}.wrap>.card:nth-of-type(3){grid-column:2/-1!important;grid-row:3!important}.wrap>details{grid-column:2/-1!important}.signal{font-size:clamp(35px,4vw,65px)!important;letter-spacing:-2px!important;overflow-wrap:anywhere}.card{border-radius:18px!important}@media(max-width:900px){.wrap{display:flex!important;flex-direction:column!important;gap:12px!important;padding:14px!important}.sidebar{display:flex;flex-direction:row;align-items:center;overflow-x:auto;padding:8px!important;gap:6px;border-radius:13px}.sidebrand{font-size:14px;padding:8px;white-space:nowrap}.sideitem{font-size:12px;padding:10px;white-space:nowrap}.sidefoot{display:none}.head{padding:12px 16px!important}.logo{font-size:18px!important}.card{padding:18px!important}.wrap>.card:nth-of-type(1){order:1}.wrap>.card:nth-of-type(2){order:2}.wrap>.card:nth-of-type(3){order:3}.wrap>details{order:4}.signal{font-size:clamp(36px,10vw,62px)!important;letter-spacing:-2px!important}.price{font-size:clamp(18px,5vw,32px)!important}.label{font-size:10px!important;letter-spacing:1px!important}.diff{font-size:17px!important;margin:14px 0!important}svg{height:210px!important}}.heading{display:flex;flex-direction:column;gap:4px}.eyebrow{font-size:10px;letter-spacing:1.5px;color:#8e9cb9}.subheading{font-size:12px;color:#8999b8}.metrics{grid-column:2/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{min-width:0;background:linear-gradient(125deg,#1d2943,#171e33);border:1px solid #303957;border-radius:17px;padding:18px;display:flex;flex-direction:column;gap:10px}.metric span{font-size:10px;letter-spacing:1px;color:#9aa6c3}.metric strong{font-size:clamp(16px,2vw,26px);white-space:nowrap;letter-spacing:-.8px}.metric small{font-size:11px;color:#7e90b0}.wrap>.card:nth-of-type(1){grid-row:3!important}.wrap>.card:nth-of-type(2){grid-row:3!important}.wrap>.card:nth-of-type(3){grid-row:4!important}.sidebar{grid-row:1/6!important}.wrap>details{grid-column:2/-1!important}@media(max-width:900px){.metrics{order:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.metric{padding:13px;border-radius:12px}.metric strong{font-size:clamp(16px,4.3vw,23px)}.metric span{font-size:9px}.metric small{font-size:10px}.head{order:0}.sidebar{order:0}.wrap>.card:nth-of-type(1){order:1}.wrap>.card:nth-of-type(2){order:2}.wrap>.card:nth-of-type(3){order:3}}body{background:#0a0915!important}.sidebar{background:#100e22!important;border-color:#27213e!important}.sideitem.active{background:#6334b7!important;color:white!important}.sidebrand,.logo{color:#d0aaff!important}.head{background:#110f24!important;border-color:#27213e!important}.card,.metric{background:linear-gradient(135deg,#1c1537,#100f23)!important;border:1px solid #312449!important;box-shadow:0 8px 32px #05030e66!important}.metric:nth-child(2){background:linear-gradient(130deg,#17152f,#111a27)!important}.metric:nth-child(3){background:linear-gradient(130deg,#1e1631,#141020)!important}.metric:nth-child(4){background:linear-gradient(130deg,#20142c,#141020)!important}.metric strong{color:#f1e9ff!important}.fill{background:linear-gradient(90deg,#8d4de5,#d1a0ff)!important}.signal.warn{color:#ffbc69}.pill{background:#30214d!important;color:#dfc8ff!important}.donutrow{display:flex;align-items:center;justify-content:center;gap:24px;margin:22px 0}.donut{--pct:0;width:170px;height:170px;flex:none;border-radius:50%;background:conic-gradient(#a576ff calc(var(--pct)*1%),#ffb660 0);display:grid;place-items:center;box-shadow:0 0 30px #6731ac30}.donutcore{width:118px;height:118px;border-radius:50%;background:#151128;display:grid;place-items:center;color:#fff;font-size:31px;font-weight:850}.donutlegend{display:grid;gap:13px;color:#aab0cb;font-size:12px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}.dot.good{background:#a576ff}.dot.bad{background:#ffb660}.dot.neutral{background:#6c6687}.wrap>.card:nth-of-type(3){grid-column:3!important;grid-row:4!important}.wrap>.card:nth-of-type(2){grid-row:3/5!important}#chart{stroke:#ae82ff!important;stroke-width:3.5!important}svg{height:270px!important;background:linear-gradient(180deg,#6c3cae17,#0c0b1a00)!important}@media(max-width:900px){.donutrow{gap:12px}.donut{width:130px;height:130px}.donutcore{width:90px;height:90px;font-size:25px}.wrap>.card:nth-of-type(2){order:2}.wrap>.card:nth-of-type(3){order:3}svg{height:190px!important}}
