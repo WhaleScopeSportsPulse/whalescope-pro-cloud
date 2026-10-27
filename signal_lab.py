@@ -283,10 +283,20 @@ def cycle():
    if market is None or now>=stamp(market.get("close_time") or market.get("expiration_time") or ""):
     market=None
     market=find_market(now)
+    fresh=True
    else:
-    detail=fetch(BASE+"markets/"+urllib.parse.quote(market["ticker"],safe="")).get("market",{})
-    market={**market,**{k:v for k,v in detail.items() if v is not None}}
-   m=dict(market);ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
+    try:
+     detail=fetch(BASE+"markets/"+urllib.parse.quote(market["ticker"],safe="")).get("market",{})
+     market={**market,**{k:v for k,v in detail.items() if v is not None}}
+     fresh=True
+    except Exception as ex:
+     # Keep collecting BTC for this round; never reuse stale quotes as current.
+     print("QUOTE",repr(ex),flush=True)
+     fresh=False
+   m=dict(market)
+   if not fresh:
+    for k in ("yes_ask_dollars","no_ask_dollars","yes_bid_dollars","no_bid_dollars"):m[k]=None
+   ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
    target=m.get("floor_strike")
    if target is None:target=m.get("strike_price")
    if target is None:
