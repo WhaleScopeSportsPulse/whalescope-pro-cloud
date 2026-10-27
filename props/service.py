@@ -1,4 +1,4 @@
-"""Join prop lines with player game logs and compute hit rates."""
+"""Join prop lines with player game logs: hit rates, availability and the v2 model."""
 from __future__ import annotations
 
 import datetime as dt
@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Optional
 
-from . import espn, kalshi, underdog
+from . import espn, kalshi, model, underdog
 from .hitrate import hit_rates
 from .props import Prop
 from .stats import STATS, get as get_stat
@@ -18,6 +18,9 @@ log = logging.getLogger("props")
 WORKERS = int(os.environ.get("PROPS_WORKERS", 6))
 SEASONS_BACK = int(os.environ.get("PROPS_H2H_SEASONS_BACK", 2))
 WINDOW_KEYS = ("l5", "l10", "l20", "season", "h2h")
+AVAILABILITY_KEYS = ("injury_status", "starter", "min_l5", "min_season", "min_trend")
+MODEL_KEYS = ("p_model", "edge", "edge_side", "model_version")
+LINEUP_WINDOW = dt.timedelta(minutes=90)  # look for posted NBA starters this close to tip-off
 
 
 def _resolve_player(p: Prop) -> Optional[dict]:
@@ -38,6 +41,13 @@ def enrich(props: list[Prop]) -> list[dict]:
             continue
         cat = get_stat(p.league, p.stat).category
         groups.setdefault((p.league, p.player.lower(), p.team_id, cat), []).append(p)
+    hurt: dict[str, dict[str, str]] = {}
+    for league in {k[0] for k in groups}:
+        try:
+            hurt[league] = espn.injuries(league)
+        except Exception as e:  # availability is best effort; rates still load
+            log.warning("injuries unavailable for %s: %s", league, e)
+            hurt[league] = {}
 
     def work(items: list[Prop]) -> list[dict]:
         first = items[0]
@@ -50,17 +60,40 @@ def enrich(props: list[Prop]) -> list[dict]:
         except Exception as e:  # keep one bad lookup from sinking the slate
             log.warning("lookup failed for %s: %s", first.player, e)
             return [_row(p, error=f"lookup failed: {e}") for p in items]
+        avail = {"injury_status": hurt.get(first.league, {}).get(player["id"]), "starter": None,
+                 **model.minutes_trend(first.league, games, season)}
         out = []
         for p in items:
             if not p.team_id:
                 p.team_id = player["team_id"]
                 p.team = next((t["abbr"] for t in espn.teams(p.league).values() if t["id"] == p.team_id), p.team)
-            hr = hit_rates(games, get_stat(p.league, p.stat), p.line, season, p.opponent_id)
-            out.append(_row(p, athlete_id=player["id"], rates=hr))
+            if p.league == "nba" and avail["starter"] is None:
+                avail["starter"] = _starter(p, player["id"])
+            stat = get_stat(p.league, p.stat)
+            hr = hit_rates(games, stat, p.line, season, p.opponent_id)
+            row = _row(p, athlete_id=player["id"], rates=hr)
+            row.update(avail)
+            row.update(model.evaluate(row, p.league, stat, games, season))
+            out.append(row)
         return out
 
     with ThreadPoolExecutor(WORKERS) as ex:
         return [r for rows in ex.map(work, groups.values()) for r in rows] + [_row(p) for p in bare]
+
+
+def _starter(p: Prop, athlete_id: str) -> Optional[bool]:
+    """Whether ESPN lists the player in the starting lineup, None until a lineup is posted."""
+    when = espn.parse_time(p.start_time)
+    now = dt.datetime.now(dt.timezone.utc)
+    if not p.team_id or not when or not now - dt.timedelta(hours=4) <= when <= now + LINEUP_WINDOW:
+        return None
+    try:
+        ev = espn.find_event(p.league, p.team_id, p.opponent_id, when)
+        ids = espn.starters(p.league, ev["id"], p.team_id) if ev else None
+    except Exception as e:
+        log.warning("lineup unavailable for %s: %s", p.player, e)
+        return None
+    return None if ids is None else athlete_id in ids
 
 
 def _row(p: Prop, athlete_id: Optional[str] = None, rates: Optional[dict] = None,
@@ -69,6 +102,7 @@ def _row(p: Prop, athlete_id: Optional[str] = None, rates: Optional[dict] = None
     d["stat_label"] = p.stat_label or get_stat(p.league, p.stat).label
     d["athlete_id"] = athlete_id
     d["error"] = error
+    d.update({k: None for k in (*AVAILABILITY_KEYS, *MODEL_KEYS)})
     if rates:
         d.update({k: rates[k] for k in (*WINDOW_KEYS, "recent")})
         l10 = rates["l10"]["rate"]

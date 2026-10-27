@@ -16,6 +16,11 @@ from typing import Iterable, Optional
 
 from .service import WINDOW_KEYS
 
+# Added after the table first shipped; ADD COLUMN IF NOT EXISTS upgrades existing boards in place.
+EXTRA_COLS = ("injury_status text, starter boolean, min_l5 double precision, min_season double precision, "
+              "min_trend double precision, p_model double precision, edge double precision, edge_side text, "
+              "model_version text")
+
 CHUNK = 1000
 
 SCHEMA = [
@@ -47,13 +52,14 @@ SCHEMA = [
         updated_at timestamptz NOT NULL DEFAULT now()
     )""",
     "CREATE INDEX IF NOT EXISTS props_board_league_source ON props.props_board (league, source)",
+    *(f"ALTER TABLE props.props_board ADD COLUMN IF NOT EXISTS {c}" for c in EXTRA_COLS.split(", ")),
 ]
 
 _COLS = ("source text, league text, stat text, stat_label text, player text, team text, opponent text, "
          "line double precision, over_price double precision, under_price double precision, "
          "start_time timestamptz, market_id text, url text, athlete_id text, "
          + ", ".join(f"{k}_rate double precision, {k}_games int" for k in WINDOW_KEYS)
-         + ", l10_minus_price double precision, windows jsonb, recent jsonb, error text")
+         + ", l10_minus_price double precision, windows jsonb, recent jsonb, error text, " + EXTRA_COLS)
 _NAMES = ", ".join(c.split()[0] for c in _COLS.split(", "))
 INSERT = (f"INSERT INTO props.props_board ({_NAMES}) "
           f"SELECT {_NAMES} FROM jsonb_to_recordset($1::jsonb) AS r({_COLS})")
@@ -62,7 +68,8 @@ INSERT = (f"INSERT INTO props.props_board ({_NAMES}) "
 def _flat(r: dict) -> dict:
     d = {k: r.get(k) for k in ("source", "league", "stat", "stat_label", "player", "team", "opponent", "line",
                                "over_price", "under_price", "start_time", "market_id", "url", "athlete_id",
-                               "l10_minus_price", "recent", "error")}
+                               "l10_minus_price", "recent", "error",
+                               *(c.split()[0] for c in EXTRA_COLS.split(", ")))}
     for k in WINDOW_KEYS:
         w = r.get(k) or {}
         d[f"{k}_rate"], d[f"{k}_games"] = w.get("rate"), w.get("games")

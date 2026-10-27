@@ -5,10 +5,12 @@
     python -m props player --league nba --name "Zach LaVine" --stat points --line 24.5 --opponent SA
     python -m props load                       # one refresh, written to props.props_board ($DATABASE_URL)
                                                # and qualifying picks logged/graded in props.picks_log
+    python -m props report --days 1            # picks results per rule and model calibration
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 import os
@@ -113,6 +115,10 @@ def main(argv=None) -> int:
     pl.add_argument("--team")
     pl.add_argument("--opponent")
 
+    rp = sub.add_parser("report", help="picks_log results per rule (deduplicated) and model calibration")
+    rp.add_argument("--days", type=float, default=1, help="picks logged in the last N days (default 1)")
+    rp.add_argument("--json", action="store_true")
+
     ld = sub.add_parser("load", help="refresh once and replace props.props_board in $DATABASE_URL")
     ld.add_argument("--league", action="append")
     ld.add_argument("--from-json", help="load rows saved by `slate --json` instead of fetching")
@@ -134,6 +140,16 @@ def main(argv=None) -> int:
             print_table(rows, a.side)
     elif a.cmd == "player":
         print(json.dumps(player_report(a.league, a.name, a.stat, a.line, a.team, a.opponent), indent=1))
+    elif a.cmd == "report":
+        from . import picks
+        if not os.environ.get("DATABASE_URL"):
+            print("DATABASE_URL is not set", file=sys.stderr)
+            return 2
+        rep = picks.report(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=a.days))
+        if a.json:
+            print(json.dumps(rep, indent=1))
+        else:
+            print_report(rep)
     elif a.cmd == "load":
         from . import db
         if not os.environ.get("DATABASE_URL"):
@@ -159,6 +175,19 @@ def main(argv=None) -> int:
                 logging.exception("picks_log failed")
                 print(f"picks_log failed: {e}", file=sys.stderr)
     return 0
+
+
+def print_report(rep: dict) -> None:
+    print(f"picks logged since {rep['since'][:16]}Z, one per player + stat + line + side + game")
+    print(f"{'RULE':12} {'PICKS':>5} {'GRADED':>6} {'HIT':>4} {'MISS':>4} {'PUSH':>4} {'VOID':>4} {'HIT%':>6}")
+    for rule, d in sorted(rep["rules"].items()):
+        rate = f"{d['hit_rate'] * 100:5.1f}%" if d["hit_rate"] is not None else "     -"
+        print(f"{rule:12} {d['picks']:>5} {d['graded']:>6} {d['hit']:>4} {d['miss']:>4} {d['push']:>4} "
+              f"{d['void']:>4} {rate:>6}")
+    print(f"\ncalibration ({rep['calibrated_bets']} graded bets with a model probability, Brier {rep['brier']})")
+    print(f"{'P(SIDE)':11} {'N':>4} {'AVG P':>6} {'HIT%':>6}")
+    for b in rep["calibration"]:
+        print(f"{b['bin']:11} {b['n']:>4} {b['avg_p']:>6.3f} {b['hit_rate'] * 100:5.1f}%")
 
 
 def _fmt(w, side="over") -> str:

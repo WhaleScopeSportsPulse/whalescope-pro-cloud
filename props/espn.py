@@ -54,7 +54,7 @@ def normalize_name(name: str) -> str:
 
 def teams(league: str) -> dict[str, dict]:
     """ESPN abbreviation -> {"id", "abbr", "name"}."""
-    data = net.get_json(f"{SITE}{LEAGUES[league]}/teams", ttl=ROSTER_TTL)
+    data = net.get_json(f"{SITE}{LEAGUES[league]}/teams", {"limit": 1000}, ttl=ROSTER_TTL)  # cfb: 700+ teams
     out = {}
     for t in data["sports"][0]["leagues"][0]["teams"]:
         t = t["team"]
@@ -189,14 +189,17 @@ def parse_time(s: Optional[str]) -> Optional[dt.datetime]:
 
 def scoreboard(league: str, day: dt.date) -> list[dict]:
     """ESPN events for one US date: id, start, state ("pre"/"in"/"post"), status name, team ids."""
-    data = net.get_json(f"{SITE}{LEAGUES[league]}/scoreboard", {"dates": day.strftime("%Y%m%d")}, ttl=60)
+    data = net.get_json(f"{SITE}{LEAGUES[league]}/scoreboard", {"dates": day.strftime("%Y%m%d"), "limit": 300},
+                        ttl=60)
     out = []
     for e in data.get("events") or []:
         comp = (e.get("competitions") or [{}])[0]
         st = (e.get("status") or comp.get("status") or {}).get("type") or {}
         out.append({"id": str(e["id"]), "start": parse_time(e.get("date")), "state": st.get("state"),
                     "name": st.get("name") or "", "completed": bool(st.get("completed")),
-                    "teams": {str((c.get("team") or {}).get("id")) for c in comp.get("competitors") or []}})
+                    "teams": {str((c.get("team") or {}).get("id")) for c in comp.get("competitors") or []},
+                    "abbrs": {str((c.get("team") or {}).get("id")): ((c.get("team") or {}).get("abbreviation") or "").upper()
+                              for c in comp.get("competitors") or []}})
     return out
 
 
@@ -211,3 +214,87 @@ def find_event(league: str, team_id: str, opponent_id: Optional[str], near: dt.d
             if best is None or abs(e["start"] - near) < abs(best["start"] - near):
                 best = e
     return best
+
+
+def match_game(league: str, team: str, opp: str, start: Optional[str], table: dict) -> Optional[tuple[dict, dict]]:
+    """(team, opponent) from the ESPN game at `start` in which at least one code matches a side."""
+    when = parse_time(start)
+    if not when:
+        return None
+    by_id = {t["id"]: t for t in table.values()}
+    want = {code.upper(): code for code in (team, opp)}
+    day = when.astimezone(ET).date()
+    for e in scoreboard(league, day) + scoreboard(league, day - dt.timedelta(days=1)):
+        if not e["start"] or abs(e["start"] - when) > dt.timedelta(hours=1) or len(e["abbrs"]) != 2:
+            continue
+        hits = {tid: a for tid, a in e["abbrs"].items()
+                if a in want or (m := match_team(league, a, table)) and m["abbr"] in want}
+        if len(hits) != 1:  # need exactly one anchoring side; two exact hits fall through to match_team
+            continue
+        known, code = next(iter(hits.items()))
+        other = next(tid for tid in e["abbrs"] if tid != known)
+        a, b = by_id.get(known), by_id.get(other)
+        if not (a and b):
+            continue
+        return (a, b) if code == team.upper() else (b, a)
+    return None
+
+
+INJURY_TTL = 600
+
+
+def _designation(status: str, comment: str) -> Optional[str]:
+    """ESPN injury status -> Out / Doubtful / Questionable / Probable / Day-To-Day, or None if active."""
+    s, c = (status or "").lower(), (comment or "").lower()
+    if s in ("active", ""):
+        return None
+    if s == "out" or "il" in s.split("-") or "reserve" in s or "suspension" in s:
+        return "Out"
+    if s in ("doubtful", "questionable", "probable"):
+        return s.title()
+    # NBA lists the official tag only in the comment ("X is questionable for Wednesday's game").
+    for tag, words in (("Out", ("ruled out", " is out ", "will not play", "won't play")),
+                       ("Doubtful", ("doubtful",)), ("Questionable", ("questionable",)), ("Probable", ("probable",))):
+        if any(w in f" {c} " for w in words):
+            return tag
+    return "Day-To-Day"
+
+
+def injuries(league: str) -> dict[str, str]:
+    """ESPN athlete id -> injury designation for every listed player in the league."""
+    data = net.get_json(f"{SITE}{LEAGUES[league]}/injuries", ttl=INJURY_TTL)
+    out = {}
+    for team in data.get("injuries") or []:
+        for i in team.get("injuries") or []:
+            links = (i.get("athlete") or {}).get("links") or []
+            m = next((re.search(r"/id/(\d+)", l.get("href", "")) for l in links if "/id/" in l.get("href", "")), None)
+            tag = _designation(i.get("status"), i.get("shortComment"))
+            if m and tag:
+                out[m.group(1)] = tag
+    return out
+
+
+CORE = os.environ.get("ESPN_CORE_BASE", "https://sports.core.api.espn.com/v2/sports/")
+
+
+def starters(league: str, event_id: str, team_id: str) -> Optional[set[str]]:
+    """Athlete ids ESPN lists as starting, or None until ESPN posts the lineup (usually near tip-off)."""
+    sport, lg = LEAGUES[league].split("/")
+    data = net.get_json(f"{CORE}{sport}/leagues/{lg}/events/{event_id}/competitions/{event_id}"
+                        f"/competitors/{team_id}/roster", ttl=300)
+    ids = {str(e.get("playerId")) for e in data.get("entries") or [] if e.get("starter")}
+    return ids or None
+
+
+def minutes(league: str, g: Game) -> Optional[float]:
+    """Minutes played (basketball) or time on ice (hockey) in one game."""
+    v = g.row.get("minutes") if league in ("nba", "wnba") else g.row.get("timeOnIcePerGame") if league == "nhl" else None
+    if v in (None, "", "-", "--"):
+        return None
+    try:
+        if ":" in str(v):
+            mm, ss = str(v).split(":", 1)
+            return int(mm) + int(ss) / 60
+        return float(v)
+    except ValueError:
+        return None

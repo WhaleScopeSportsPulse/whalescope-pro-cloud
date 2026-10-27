@@ -27,16 +27,22 @@ _BASKETBALL = {
     "steals": "steals", "blocks": "blocks", "blks_stls": "stocks", "pts_rebs_asts": "pra",
     "pts_rebs": "pr", "pts_asts": "pa", "rebs_asts": "ra", "free_throws_made": "ftm",
 }
+# Full-game stats only: quarter/half, first/last scorer and fantasy lines need data game logs don't have.
+_FOOTBALL = {
+    "passing_yds": "pass_yds", "passing_tds": "pass_tds", "passing_att": "pass_att",
+    "passing_comps": "pass_comp", "passing_ints": "pass_int", "passing_long": "pass_long",
+    "rushing_yds": "rush_yds", "rushing_att": "rush_att", "rushing_long": "rush_long",
+    "receiving_yds": "rec_yds", "receiving_rec": "receptions", "receiving_tgts": "targets",
+    "receiving_long": "rec_long", "rush_rec_yds": "rush_rec_yds", "passing_and_rushing_yds": "pass_rush_yds",
+    "rush_rec_tds": "anytime_td", "fumbles_lost": "fumbles_lost", "field_goals_made": "fg_made",
+    "extra_points_made": "xp_made", "kicking_points": "kicking_points",
+}
 # Underdog stat key -> stats.py key, per league ESPN covers.
 STAT_MAP = {
     "nba": _BASKETBALL,
     "wnba": _BASKETBALL,
-    "nfl": {
-        "passing_yds": "pass_yds", "passing_tds": "pass_tds", "passing_att": "pass_att",
-        "passing_comps": "pass_comp", "passing_ints": "pass_int", "rushing_yds": "rush_yds",
-        "rushing_att": "rush_att", "receiving_yds": "rec_yds", "receiving_rec": "receptions",
-        "rush_rec_yds": "rush_rec_yds",
-    },
+    "nfl": _FOOTBALL,
+    "cfb": _FOOTBALL,
     "mlb": {
         "hits": "hits", "home_runs": "home_runs", "rbis": "rbis", "runs": "runs", "total_bases": "total_bases",
         "hits_runs_rbis": "hrr", "stolen_bases": "stolen_bases", "strikeouts": "pitcher_ks",
@@ -93,6 +99,10 @@ def parse(data: dict, leagues: Optional[Iterable[str]] = None) -> list[Prop]:
             table = tables.get(sport) or tables.setdefault(sport, espn.teams(sport))
             t = espn.match_team(sport, team, table) if team else None
             o = espn.match_team(sport, opp, table) if opp else None
+            # College codes collide (Underdog's JSU is ESPN's JXST; ESPN's JSU is Jackson State),
+            # so pair them with the game on ESPN's scoreboard instead.
+            if team and opp and (sport == "cfb" or not (t and o)):
+                t, o = espn.match_game(sport, team, opp, game.get("scheduled_at"), table) or (t, o)
             p.team, p.team_id = (t["abbr"], t["id"]) if t else (team, None)
             p.opponent, p.opponent_id = (o["abbr"], o["id"]) if o else (opp, None)
         out.append(p)

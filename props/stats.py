@@ -17,6 +17,7 @@ LEAGUES = {
     "nfl": "football/nfl",
     "mlb": "baseball/mlb",
     "nhl": "hockey/nhl",
+    "cfb": "football/college-football",
 }
 
 
@@ -77,6 +78,7 @@ class Stat:
     label: str
     value: Callable[[dict], Optional[float]]
     category: Optional[str] = None  # ESPN gamelog ?category= (MLB batting/pitching)
+    continuous: bool = False        # yardage-like: model with a normal, not a count distribution
 
 
 _pts, _reb, _ast = field("points"), field("totalRebounds"), field("assists")
@@ -102,22 +104,48 @@ def _basketball(league: str) -> list[Stat]:
     ]
 
 
+def _any(*names: str) -> Callable[[dict], Optional[float]]:
+    """Sum of the named fields a row has (missing ones count 0); None if it has none of them.
+
+    ESPN only lists a player's own categories, e.g. a QB's log has no receiving columns."""
+    def f(row: dict) -> Optional[float]:
+        vals = [num(row, n) for n in names if n in row]
+        return sum(v for v in vals if v is not None) if vals else None
+    return f
+
+
+def _football(league: str) -> list[Stat]:
+    return [
+        Stat(league, "pass_yds", "Passing Yards", field("passingYards"), continuous=True),
+        Stat(league, "pass_tds", "Passing TDs", field("passingTouchdowns")),
+        Stat(league, "pass_att", "Pass Attempts", field("passingAttempts")),
+        Stat(league, "pass_comp", "Completions", field("completions")),
+        Stat(league, "pass_int", "Interceptions Thrown", field("interceptions")),
+        Stat(league, "pass_long", "Longest Completion", field("longPassing"), continuous=True),
+        Stat(league, "rush_yds", "Rushing Yards", field("rushingYards"), continuous=True),
+        Stat(league, "rush_att", "Rushing Attempts", field("rushingAttempts")),
+        Stat(league, "rush_long", "Longest Rush", field("longRushing"), continuous=True),
+        Stat(league, "rec_yds", "Receiving Yards", field("receivingYards"), continuous=True),
+        Stat(league, "receptions", "Receptions", field("receptions")),
+        Stat(league, "targets", "Targets", field("receivingTargets")),
+        Stat(league, "rec_long", "Longest Reception", field("longReception"), continuous=True),
+        Stat(league, "rush_rec_yds", "Rush + Rec Yards", _any("rushingYards", "receivingYards"), continuous=True),
+        Stat(league, "pass_rush_yds", "Pass + Rush Yards", _any("passingYards", "rushingYards"), continuous=True),
+        Stat(league, "anytime_td", "Rush + Rec TDs", _any("rushingTouchdowns", "receivingTouchdowns")),
+        Stat(league, "fumbles_lost", "Fumbles Lost", field("fumblesLost")),
+        Stat(league, "fg_made", "FG Made", lambda r: made(r, "fieldGoalsMade-fieldGoalAttempts")),
+        Stat(league, "xp_made", "XP Made", lambda r: made(r, "extraPointsMade-extraPointAttempts")),
+        Stat(league, "kicking_points", "Kicking Points", field("totalKickingPoints")),
+    ]
+
+
 STATS: dict[tuple[str, str], Stat] = {}
 for _s in (
     _basketball("nba")
     + _basketball("wnba")
+    + _football("nfl")
+    + _football("cfb")
     + [
-        Stat("nfl", "pass_yds", "Passing Yards", field("passingYards")),
-        Stat("nfl", "pass_tds", "Passing TDs", field("passingTouchdowns")),
-        Stat("nfl", "pass_att", "Pass Attempts", field("passingAttempts")),
-        Stat("nfl", "pass_comp", "Completions", field("completions")),
-        Stat("nfl", "pass_int", "Interceptions Thrown", field("interceptions")),
-        Stat("nfl", "rush_yds", "Rushing Yards", field("rushingYards")),
-        Stat("nfl", "rush_att", "Rushing Attempts", field("rushingAttempts")),
-        Stat("nfl", "rec_yds", "Receiving Yards", field("receivingYards")),
-        Stat("nfl", "receptions", "Receptions", field("receptions")),
-        Stat("nfl", "rush_rec_yds", "Rush + Rec Yards",
-             total(lambda r: num(r, "rushingYards") or 0.0, lambda r: num(r, "receivingYards") or 0.0)),
         Stat("mlb", "hits", "Hits", field("hits"), "batting"),
         Stat("mlb", "home_runs", "Home Runs", field("homeRuns"), "batting"),
         Stat("mlb", "rbis", "RBIs", field("RBIs"), "batting"),

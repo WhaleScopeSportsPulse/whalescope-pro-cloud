@@ -3,7 +3,7 @@ from unittest import mock
 
 import datetime as dt
 
-from props import espn, kalshi, picks, service, underdog
+from props import espn, kalshi, model, picks, service, underdog
 from props.espn import Game, parse_gamelog
 from props.hitrate import hit_rates, window
 from props.props import Prop
@@ -264,6 +264,152 @@ class Picks(unittest.TestCase):
         with mock.patch.object(picks.espn, "current_season", return_value=2027), \
                 mock.patch.object(picks.net, "get_json", side_effect=err):
             self.assertEqual(picks._player_game("nhl", "1", "shots", "9"), (False, None))
+
+
+def log_game(i, value, minutes="30", season=2027, key="points"):
+    return Game(event_id=str(i), date=f"2026-{10 - i // 28:02d}-{28 - i % 28:02d}", season=season, postseason=False,
+                team_id="9", opponent_id="2", opponent="BOS", home=True, row={key: str(value), "minutes": minutes})
+
+
+class ModelV2(unittest.TestCase):
+    def test_count_distributions(self):
+        self.assertAlmostEqual(model._poisson_cdf(2, 2.0), 0.6767, places=4)
+        self.assertAlmostEqual(model._nbinom_cdf(2, 2.0, 4.0), 0.6875, places=4)   # r=2, p=0.5
+        # Whole-number line: the push is removed from both sides.
+        over = model._count_over(2, 2.0, 2.0)
+        p_eq = model._poisson_cdf(2, 2.0) - model._poisson_cdf(1, 2.0)
+        self.assertAlmostEqual(over, (1 - model._poisson_cdf(2, 2.0)) / (1 - p_eq), places=6)
+        self.assertAlmostEqual(model._normal_over(70.5, 70.5, 20), 0.5)
+
+    def test_recent_games_weigh_more(self):
+        hot = [log_game(i, 30 if i < 10 else 15) for i in range(20)]
+        cold = [log_game(i, 15 if i < 10 else 30) for i in range(20)]
+        stat = get("nba", "points")
+        p_hot, n = model.p_over("nba", stat, 22.5, hot, 2027)
+        p_cold, _ = model.p_over("nba", stat, 22.5, cold, 2027)
+        self.assertEqual(n, 20)
+        older = [log_game(i, 20, season=2027 if i < 25 else 2026) for i in range(30)]
+        self.assertEqual(model.p_over("nba", stat, 22.5, older, 2027)[1], 25)  # last 20 + rest of this season
+        # Same values, opposite order: the hot-recent player is well above the cold-recent one.
+        self.assertGreater(p_hot - p_cold, 0.2)
+        self.assertIsNone(model.p_over("nba", stat, 22.5, hot[:4], 2027))
+
+    def test_minutes_trend_scales_the_mean(self):
+        stat = get("nba", "points")
+        flat = [log_game(i, 20) for i in range(20)]
+        more = [log_game(i, 20, minutes="36" if i < 5 else "30") for i in range(20)]
+        self.assertGreater(model.p_over("nba", stat, 21.5, more, 2027)[0], model.p_over("nba", stat, 21.5, flat, 2027)[0])
+        t = model.minutes_trend("nba", more, 2027)
+        self.assertEqual((t["min_l5"], t["min_season"], t["min_trend"]), (36.0, 31.5, 1.143))
+
+    def test_evaluate_blends_market_and_charges_kalshi_fee(self):
+        games = [log_game(i, v) for i, v in enumerate([25, 28, 30, 22, 27, 26, 24, 29, 31, 23] * 2)]
+        row = {"source": "kalshi", "line": 24.5, "over_price": 0.55, "under_price": 0.47}
+        out = model.evaluate(row, "nba", get("nba", "points"), games, 2027)
+        p_stat, n = model.p_over("nba", get("nba", "points"), 24.5, games, 2027)
+        w = model.W_MAX * n / (n + model.K)
+        self.assertAlmostEqual(out["p_model"], round(w * p_stat + (1 - w) * 0.54, 4), places=4)
+        self.assertEqual(out["edge_side"], "over")
+        self.assertAlmostEqual(out["edge"], round(out["p_model"] - 0.55 - 0.07 * 0.55 * 0.45, 4), places=4)
+        ud = model.evaluate(dict(row, source="underdog"), "nba", get("nba", "points"), games, 2027)
+        self.assertAlmostEqual(model.market_prob(0.55, 0.47, "underdog"), 0.55 / 1.02)
+        self.assertIsNotNone(ud["edge"])
+
+
+class Availability(unittest.TestCase):
+    def test_designations(self):
+        d = espn._designation
+        self.assertEqual(d("Out", ""), "Out")
+        self.assertEqual(d("Injured Reserve", ""), "Out")
+        self.assertEqual(d("60-Day-IL", ""), "Out")
+        self.assertEqual(d("Questionable", ""), "Questionable")
+        self.assertEqual(d("Day-To-Day", "Wiggins is questionable for Wednesday's game."), "Questionable")
+        self.assertEqual(d("Day-To-Day", "Brunson is doubtful for Friday."), "Doubtful")
+        self.assertEqual(d("Day-To-Day", "He was ruled out for Wednesday."), "Out")
+        self.assertEqual(d("Day-To-Day", "Listed as day-to-day."), "Day-To-Day")
+        self.assertIsNone(d("Active", ""))
+
+    def test_injuries_feed(self):
+        feed = {"injuries": [{"injuries": [
+            {"status": "Out", "shortComment": "", "athlete": {"links": [{"href": "https://www.espn.com/nba/player/_/id/123/x"}]}},
+            {"status": "Day-To-Day", "shortComment": "X is doubtful Friday.",
+             "athlete": {"links": [{"href": "https://www.espn.com/nba/player/_/id/456/y"}]}},
+            {"status": "Active", "athlete": {"links": [{"href": "https://www.espn.com/nfl/player/_/id/789/z"}]}}]}]}
+        with mock.patch.object(espn.net, "get_json", return_value=feed):
+            self.assertEqual(espn.injuries("nba"), {"123": "Out", "456": "Doubtful"})
+
+    def test_hockey_time_on_ice(self):
+        g = Game("1", "2026-10-26", 2027, False, "9", "2", "BOS", True, {"timeOnIcePerGame": "18:30"})
+        self.assertEqual(espn.minutes("nhl", g), 18.5)
+        self.assertIsNone(espn.minutes("nfl", g))
+
+
+CFB = {"NMSU": {"id": "166", "abbr": "NMSU", "name": "New Mexico State"},
+       "JXST": {"id": "55", "abbr": "JXST", "name": "Jacksonville State"},
+       "JSU": {"id": "2296", "abbr": "JSU", "name": "Jackson State"}}
+
+
+class CollegeFootball(unittest.TestCase):
+    def test_codes_paired_through_scoreboard(self):
+        ev = {"id": "1", "start": dt.datetime(2026, 10, 29, 0, 0, tzinfo=dt.timezone.utc), "state": "pre", "name": "",
+              "completed": False, "teams": {"166", "55"}, "abbrs": {"166": "NMSU", "55": "JXST"}}
+        with mock.patch.object(espn, "scoreboard", return_value=[ev]):
+            t, o = espn.match_game("cfb", "JSU", "NMSU", "2026-10-29T00:00:00Z", CFB)
+            self.assertEqual((t["abbr"], o["abbr"]), ("JXST", "NMSU"))
+            t, o = espn.match_game("cfb", "NMSU", "JSU", "2026-10-29T00:00:00Z", CFB)
+            self.assertEqual((t["abbr"], o["abbr"]), ("NMSU", "JXST"))
+            self.assertIsNone(espn.match_game("cfb", "JSU", "NMSU", "2026-10-30T00:00:00Z", CFB))
+
+    def test_football_stats(self):
+        qb = {"passingYards": "250", "rushingYards": "30", "rushingTouchdowns": "1", "longPassing": "45"}
+        wr = {"receivingYards": "80", "rushingYards": "5", "receivingTouchdowns": "1", "rushingTouchdowns": "0",
+              "receivingTargets": "9", "longReception": "31", "fumblesLost": "0"}
+        k = {"fieldGoalsMade-fieldGoalAttempts": "2-3", "extraPointsMade-extraPointAttempts": "4-4",
+             "totalKickingPoints": "10"}
+        self.assertEqual(get("nfl", "anytime_td").value(qb), 1)
+        self.assertEqual(get("cfb", "anytime_td").value(wr), 1)
+        self.assertEqual(get("nfl", "pass_rush_yds").value(qb), 280)
+        self.assertEqual(get("nfl", "rush_rec_yds").value(wr), 85)
+        self.assertIsNone(get("nfl", "rush_rec_yds").value(k))       # no rushing/receiving columns at all
+        self.assertEqual((get("nfl", "targets").value(wr), get("nfl", "rec_long").value(wr)), (9, 31))
+        self.assertEqual((get("nfl", "fg_made").value(k), get("nfl", "xp_made").value(k),
+                          get("nfl", "kicking_points").value(k)), (2, 4, 10))
+        self.assertTrue(get("cfb", "rec_yds").continuous)
+        self.assertEqual(underdog.STAT_MAP["cfb"]["rush_rec_tds"], "anytime_td")
+
+
+class PicksV2(unittest.TestCase):
+    def test_both_rules_and_injury_exclusion(self):
+        tip = dt.datetime(2026, 10, 28, 0, 0, tzinfo=dt.timezone.utc)
+        row = board_row(p_model=0.68, edge=0.093, edge_side="over", model_version="v2.0", injury_status="Questionable")
+        with mock.patch.object(espn, "scoreboard", return_value=[event(tip)]):
+            out = picks.select([row], NOW)
+            self.assertEqual(sorted((p["rule_version"], p["side"]) for p in out),
+                             [("v1_hitrate", "over"), ("v2_model", "over")])
+            v2 = next(p for p in out if p["rule_version"] == "v2_model")
+            self.assertEqual((v2["score"], v2["injury_status"], v2["edge"]), (None, "Questionable", round(0.68 - 0.55 - 0.07 * 0.55 * 0.45, 4)))
+            for tag in ("Out", "Doubtful"):
+                self.assertEqual(picks.select([dict(row, injury_status=tag)], NOW), [])
+            self.assertEqual([p["rule_version"] for p in picks.select([dict(row, edge=0.049)], NOW)], ["v1_hitrate"])
+
+    def test_report_dedupes_and_bins(self):
+        rows = [{"rule_version": "v1_hitrate", "league": "nba", "result": "hit", "p_side": 0.62},
+                {"rule_version": "v2_model", "league": "nba", "result": "miss", "p_side": 0.58},
+                {"rule_version": "v2_model", "league": "nhl", "result": None, "p_side": 0.7}]
+        calls = []
+
+        def query(sql, params=None, url=None):
+            calls.append(sql)
+            return rows if "rule_version}" not in sql and ", rule_version" in sql else rows[:2]
+        with mock.patch.object(picks.db, "query", side_effect=query):
+            rep = picks.report(NOW)
+        self.assertIn("DISTINCT ON (player, stat, line, side, event_id, rule_version)", calls[0])
+        self.assertIn("DISTINCT ON (player, stat, line, side, event_id)", calls[1])
+        self.assertEqual(rep["rules"]["v2_model"]["picks"], 2)
+        self.assertEqual(rep["rules"]["v2_model"]["graded"], 1)
+        self.assertEqual(rep["rules"]["v1_hitrate"]["hit_rate"], 1.0)
+        self.assertEqual([(b["bin"], b["n"], b["hit_rate"]) for b in rep["calibration"]],
+                         [("0.55-0.60", 1, 0.0), ("0.60-0.65", 1, 1.0)])
 
 
 class Gamelog(unittest.TestCase):

@@ -1,10 +1,16 @@
 """Log qualifying picks to props.picks_log and grade them from ESPN box scores.
 
-A prop side is logged once (per market_id + side) when its game starts within
-the next two hours and:
+Two rules run on every refresh; a prop side is logged once per market_id + side
++ rule_version when its game starts within the next two hours, the player isn't
+listed Out or Doubtful, and:
+
+v1_hitrate:
   - L5, L10 and L20 each have a full sample (5, 10, 20 games),
   - that side's hit rate is at least 0.70 in all three,
   - 0 < price < 1, and score = min(L5, L10, L20) - price >= 0.10.
+v2_model (see model.py):
+  - at least V2_MIN_GAMES games in L20, 0 < price < 1,
+  - edge = model probability - price - fee >= V2_MIN_EDGE on that side.
 
 The game and its start come from ESPN's scoreboard (the board's own start
 time only narrows the search). The ESPN event is stored with the pick and graded once ESPN marks it final: hit / miss, push
@@ -26,6 +32,9 @@ log = logging.getLogger("props")
 
 MIN_RATE = 0.70
 MIN_SCORE = 0.10
+V2_MIN_EDGE = 0.05
+V2_MIN_GAMES = 10
+EXCLUDED = ("Out", "Doubtful")
 WINDOW = dt.timedelta(hours=2)
 FULL = (("l5", 5), ("l10", 10), ("l20", 20))
 # A final game missing from the player's log counts as did-not-play only after
@@ -46,10 +55,10 @@ SCHEMA = [
         line double precision NOT NULL,
         side text NOT NULL CHECK (side IN ('over', 'under')),
         price double precision NOT NULL,
-        l5 double precision NOT NULL,
-        l10 double precision NOT NULL,
-        l20 double precision NOT NULL,
-        score double precision NOT NULL,
+        l5 double precision,
+        l10 double precision,
+        l20 double precision,
+        score double precision,
         start_time timestamptz NOT NULL,
         market_id text NOT NULL,
         result text CHECK (result IN ('hit', 'miss', 'push', 'void')),
@@ -57,20 +66,28 @@ SCHEMA = [
         graded_at timestamptz,
         stat text NOT NULL,
         athlete_id text NOT NULL,
-        event_id text NOT NULL,
-        UNIQUE (market_id, side)
+        event_id text NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS picks_log_ungraded ON props.picks_log (start_time) WHERE result IS NULL",
+    # v2 columns; v1 rows logged before them read as v1_hitrate.
+    "ALTER TABLE props.picks_log ADD COLUMN IF NOT EXISTS rule_version text NOT NULL DEFAULT 'v1_hitrate'",
+    *(f"ALTER TABLE props.picks_log ADD COLUMN IF NOT EXISTS {c}" for c in (
+        "p_model double precision", "edge double precision", "model_version text", "injury_status text",
+        "starter boolean", "min_trend double precision")),
+    *(f"ALTER TABLE props.picks_log ALTER COLUMN {c} DROP NOT NULL" for c in ("l5", "l10", "l20", "score")),
+    "ALTER TABLE props.picks_log DROP CONSTRAINT IF EXISTS picks_log_market_id_side_key",
+    "CREATE UNIQUE INDEX IF NOT EXISTS picks_log_market_side_rule ON props.picks_log (market_id, side, rule_version)",
 ]
 
 _COLS = ("source text, league text, player text, team text, opponent text, stat_label text, "
          "line double precision, side text, price double precision, l5 double precision, "
          "l10 double precision, l20 double precision, score double precision, start_time timestamptz, "
-         "market_id text, stat text, athlete_id text, event_id text")
+         "market_id text, stat text, athlete_id text, event_id text, rule_version text, p_model double precision, "
+         "edge double precision, model_version text, injury_status text, starter boolean, min_trend double precision")
 _NAMES = ", ".join(c.split()[0] for c in _COLS.split(", "))
 INSERT = (f"INSERT INTO props.picks_log ({_NAMES}) "
           f"SELECT {_NAMES} FROM jsonb_to_recordset($1::jsonb) AS r({_COLS}) "
-          "ON CONFLICT (market_id, side) DO NOTHING RETURNING id")
+          "ON CONFLICT (market_id, side, rule_version) DO NOTHING RETURNING id")
 
 
 def side_rates(row: dict, side: str) -> Optional[dict]:
@@ -97,14 +114,29 @@ def qualifies(row: dict, side: str) -> Optional[dict]:
     return {**rates, "price": price, "score": score}
 
 
+def model_qualifies(row: dict, side: str) -> Optional[dict]:
+    """The v2 rule for one side: enough games, a usable price and edge >= V2_MIN_EDGE."""
+    price = row.get("over_price" if side == "over" else "under_price")
+    if (row.get("edge_side") != side or row.get("edge") is None or row["edge"] < V2_MIN_EDGE
+            or price is None or not 0 < price < 1 or ((row.get("l20") or {}).get("games") or 0) < V2_MIN_GAMES):
+        return None
+    rates = {k: (None if (w := row.get(k) or {}).get("rate") is None
+                 else round(w["rate"] if side == "over" else 1 - w["rate"], 4)) for k, _ in FULL}
+    return {**rates, "price": price, "score": None}
+
+
+RULES = (("v1_hitrate", qualifies), ("v2_model", model_qualifies))
+
+
 def select(rows: list[dict], now: Optional[dt.datetime] = None) -> list[dict]:
-    """Pick records for rows that pass the rule and whose ESPN game starts within the next 2 hours."""
+    """Pick records for rows that pass a rule and whose ESPN game starts within the next 2 hours."""
     now = now or dt.datetime.now(dt.timezone.utc)
     out = []
     for r in rows:
-        if r.get("error") or not r.get("market_id") or not r.get("athlete_id") or not r.get("team_id"):
+        if (r.get("error") or not r.get("market_id") or not r.get("athlete_id") or not r.get("team_id")
+                or r.get("injury_status") in EXCLUDED):
             continue
-        sides = [(s, q) for s in ("over", "under") if (q := qualifies(r, s))]
+        sides = [(s, rule, q) for rule, fn in RULES for s in ("over", "under") if (q := fn(r, s))]
         if not sides:
             continue
         listed = espn.parse_time(r.get("start_time"))
@@ -114,12 +146,25 @@ def select(rows: list[dict], now: Optional[dt.datetime] = None) -> list[dict]:
         ev = espn.find_event(r["league"], r["team_id"], r.get("opponent_id"), listed)
         if not ev or ev["state"] != "pre" or not now <= ev["start"] <= now + WINDOW:
             continue
-        for side, q in sides:
+        for side, rule, q in sides:
             out.append({"source": r["source"], "league": r["league"], "player": r["player"], "team": r.get("team"),
                         "opponent": r.get("opponent"), "stat_label": r.get("stat_label"), "line": r["line"],
                         "side": side, "start_time": ev["start"].isoformat(), "market_id": r["market_id"],
-                        "stat": r["stat"], "athlete_id": r["athlete_id"], "event_id": ev["id"], **q})
+                        "stat": r["stat"], "athlete_id": r["athlete_id"], "event_id": ev["id"], "rule_version": rule,
+                        "p_model": r.get("p_model"), "model_version": r.get("model_version"),
+                        "edge": _side_edge(r, side), "injury_status": r.get("injury_status"),
+                        "starter": r.get("starter"), "min_trend": r.get("min_trend"), **q})
     return out
+
+
+def _side_edge(row: dict, side: str) -> Optional[float]:
+    """Model edge for this side (after the Kalshi fee), whichever rule picked it."""
+    from .model import kalshi_fee
+    p, price = row.get("p_model"), row.get("over_price" if side == "over" else "under_price")
+    if p is None or not price or not 0 < price < 1:
+        return None
+    prob = p if side == "over" else 1 - p
+    return round(prob - price - (kalshi_fee(price) if row["source"] == "kalshi" else 0.0), 4)
 
 
 def ensure_schema(url: Optional[str] = None) -> None:
@@ -127,7 +172,7 @@ def ensure_schema(url: Optional[str] = None) -> None:
 
 
 def log_picks(rows: list[dict], now: Optional[dt.datetime] = None, url: Optional[str] = None) -> int:
-    """Insert new picks; returns how many were new (repeats of market_id + side are skipped)."""
+    """Insert new picks; returns how many were new (repeats of market_id + side + rule are skipped)."""
     picks = select(rows, now)
     if not picks:
         return 0
@@ -201,3 +246,44 @@ def run(rows: list[dict], url: Optional[str] = None) -> tuple[int, dict]:
     """Log this refresh's picks and grade finished ones: (new picks, graded counts)."""
     ensure_schema(url)
     return log_picks(rows, url=url), grade(url=url)
+
+
+# One pick per player + stat + line + side + game, so the same bet listed on
+# Kalshi and Underdog (or picked by both rules) counts once.
+_DEDUPED = """
+    SELECT DISTINCT ON (player, stat, line, side, event_id{extra})
+           rule_version, league, result,
+           CASE WHEN side = 'over' THEN p_model ELSE 1 - p_model END AS p_side
+    FROM props.picks_log WHERE logged_at >= $1
+    ORDER BY player, stat, line, side, event_id{extra}, id
+"""
+BINS = (0.0, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 1.0001)
+
+
+def report(since: dt.datetime, url: Optional[str] = None) -> dict:
+    """Deduplicated results per rule and a calibration table (model probability bins vs. hit rate)."""
+    per_rule = db.query(_DEDUPED.format(extra=", rule_version"), [since.isoformat()], url)
+    rules: dict[str, dict] = {}
+    for r in per_rule:
+        d = rules.setdefault(r["rule_version"], {"picks": 0, "graded": 0, "hit": 0, "miss": 0, "push": 0, "void": 0})
+        d["picks"] += 1
+        if r["result"]:
+            d["graded"] += 1
+            d[r["result"]] += 1
+    for d in rules.values():
+        decided = d["hit"] + d["miss"]
+        d["hit_rate"] = round(d["hit"] / decided, 3) if decided else None
+    # Calibration pools both rules: one model probability per distinct bet.
+    bets = [r for r in db.query(_DEDUPED.format(extra=""), [since.isoformat()], url)
+            if r["p_side"] is not None and r["result"] in ("hit", "miss")]
+    table = []
+    for lo, hi in zip(BINS, BINS[1:]):
+        inbin = [r for r in bets if lo <= float(r["p_side"]) < hi]
+        if inbin:
+            table.append({"bin": f"{lo:.2f}-{min(hi, 1):.2f}", "n": len(inbin),
+                          "avg_p": round(sum(float(r["p_side"]) for r in inbin) / len(inbin), 3),
+                          "hit_rate": round(sum(r["result"] == "hit" for r in inbin) / len(inbin), 3)})
+    brier = (round(sum((float(r["p_side"]) - (r["result"] == "hit")) ** 2 for r in bets) / len(bets), 4)
+             if bets else None)
+    return {"since": since.isoformat(), "rules": rules, "calibration": table, "calibrated_bets": len(bets),
+            "brier": brier}
