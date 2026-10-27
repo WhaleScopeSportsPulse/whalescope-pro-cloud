@@ -99,6 +99,14 @@ class Snapshot:
         except Exception as e:
             log.exception("refresh failed")
             self.error = str(e)
+            return
+        if os.environ.get("DATABASE_URL"):
+            from . import db
+            try:
+                db.save(rows, ("kalshi", "underdog"), self.leagues)
+            except Exception as e:
+                log.exception("saving props_board failed")
+                self.error = f"db: {e}"
 
     def kick(self) -> None:
         self._kick.set()

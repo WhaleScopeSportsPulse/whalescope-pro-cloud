@@ -23,6 +23,7 @@ python -m props slate --league nba --window l10 --min-rate 0.7
 python -m props slate --source underdog --side under --window h2h
 python -m props player --league nba --name "Zach LaVine" --stat points --line 22.5 --opponent SAS
 python -m props import-underdog lines.csv
+python -m props load                     # refresh once and write props.props_board ($DATABASE_URL)
 python -m unittest discover -s props/tests -t .
 ```
 
@@ -51,6 +52,16 @@ takes about two minutes, mostly ESPN game-log lookups. Later ones mostly hit the
   `stat` accepts Underdog's labels or the keys in `stats.py`.
 - **Stats**: ESPN's public site API for team rosters and player game logs. Kalshi lists
   ESPN as a settlement source. These endpoints are undocumented and could change.
+
+## Database
+
+When `DATABASE_URL` is set, every server refresh (and `python -m props load`) replaces
+the rows in `props.props_board` for the leagues it covers, in one transaction. The schema
+and table are created on first save. Each row is one prop: line, prices, `*_rate` and
+`*_games` per window, the full windows in `windows` (jsonb), the last 10 games in `recent`,
+and `updated_at`. Writes go through Neon's HTTPS SQL endpoint (`https://<host>/sql`), so
+no driver is needed and they work where port 5432 is blocked. `DATABASE_URL` must be a
+Neon connection string.
 
 ## Supported props
 
@@ -87,6 +98,7 @@ Each prop row has `l5`, `l10`, `l20`, `season`, `h2h` (`games`, `over`, `under`,
 | `PROPS_H2H_SEASONS_BACK` | `2` |
 | `PROPS_DATA_DIR` | `props/data` (Underdog imports) |
 | `PROPS_ADMIN_TOKEN` | unset (imports open) |
+| `DATABASE_URL` | unset (no database writes) |
 | `KALSHI_BASE` | `https://api.elections.kalshi.com/trade-api/v2/` |
 
 Hit rates describe what already happened. They don't predict results.

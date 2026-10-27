@@ -4,6 +4,7 @@
     python -m props slate --league nba --window l10 --min-rate 0.7
     python -m props player --league nba --name "Zach LaVine" --stat points --line 24.5 --opponent SA
     python -m props import-underdog lines.csv
+    python -m props load                       # one refresh, written to props.props_board ($DATABASE_URL)
 """
 from __future__ import annotations
 
@@ -133,6 +134,10 @@ def main(argv=None) -> int:
     im = sub.add_parser("import-underdog", help="load Underdog lines from a CSV/JSON file ('-' for stdin)")
     im.add_argument("file")
 
+    ld = sub.add_parser("load", help="refresh once and replace props.props_board in $DATABASE_URL")
+    ld.add_argument("--league", choices=sorted(LEAGUES), action="append")
+    ld.add_argument("--from-json", help="load rows saved by `slate --json` instead of fetching")
+
     a = ap.parse_args(argv)
     if a.cmd == "serve":
         snap = service.Snapshot()
@@ -150,6 +155,17 @@ def main(argv=None) -> int:
             print_table(rows, a.side)
     elif a.cmd == "player":
         print(json.dumps(player_report(a.league, a.name, a.stat, a.line, a.team, a.opponent), indent=1))
+    elif a.cmd == "load":
+        from . import db
+        if not os.environ.get("DATABASE_URL"):
+            print("DATABASE_URL is not set", file=sys.stderr)
+            return 2
+        if a.from_json:
+            rows = json.load(open(a.from_json))
+        else:
+            rows = service.enrich(service.collect(leagues=a.league))
+        n = db.save(rows, ("kalshi", "underdog"), a.league)
+        print(f"saved {n} props to props.props_board")
     elif a.cmd == "import-underdog":
         text = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8-sig").read()
         rows, errors = underdog.parse(text)
