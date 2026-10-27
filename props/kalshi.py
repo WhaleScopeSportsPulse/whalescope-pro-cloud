@@ -1,6 +1,7 @@
 """Open player-prop markets from Kalshi's official public API (no auth needed)."""
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
 from typing import Iterable, Optional
@@ -110,4 +111,31 @@ def fetch_props(leagues: Optional[Iterable[str]] = None) -> list[Prop]:
             continue
         table = tables.get(league) or tables.setdefault(league, espn.teams(league))
         props += [p for m in ms if (p := parse_market(m, league, stat_key, table))]
+    starts: dict[tuple, Optional[str]] = {}
+    for p in props:
+        key = (p.league, p.team_id, p.opponent_id, p.start_time)
+        if key not in starts:
+            starts[key] = game_start(p)
+        p.start_time = starts[key]
     return props
+
+
+# Kalshi has no game-start field: occurrence_datetime is about three hours after
+# the start (checked against ESPN for NBA, NHL and MLB games).
+KALSHI_LAG = dt.timedelta(hours=3)
+
+
+def game_start(p: Prop) -> Optional[str]:
+    """The game's start from ESPN's scoreboard, else Kalshi's time minus KALSHI_LAG."""
+    listed = espn.parse_time(p.start_time)
+    if not listed:
+        return p.start_time
+    estimate = listed - KALSHI_LAG
+    if p.team_id:
+        try:
+            ev = espn.find_event(p.league, p.team_id, p.opponent_id, estimate)
+            if ev and abs(ev["start"] - estimate) <= dt.timedelta(hours=12):
+                return ev["start"].isoformat()
+        except Exception:  # scoreboard unavailable: fall back to the estimate
+            pass
+    return estimate.isoformat()

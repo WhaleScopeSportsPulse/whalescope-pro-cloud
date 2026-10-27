@@ -6,6 +6,7 @@ import datetime as dt
 from props import espn, kalshi, picks, service, underdog
 from props.espn import Game, parse_gamelog
 from props.hitrate import hit_rates, window
+from props.props import Prop
 from props.stats import get, resolve
 
 NBA = {a: {"id": str(i), "abbr": a, "name": a} for i, a in enumerate(
@@ -84,6 +85,17 @@ class Kalshi(unittest.TestCase):
         m = dict(self.MARKET, floor_strike=None, strike_type=None)
         self.assertEqual(kalshi.parse_market(m, "nba", "points", NBA).line, 14.5)
 
+    def test_start_time_from_espn(self):
+        p = kalshi.parse_market(self.MARKET, "nba", "points", NBA)   # occurrence 03:00Z
+        tip = dt.datetime(2026, 10, 28, 0, 0, tzinfo=dt.timezone.utc)
+        with mock.patch.object(espn, "find_event", return_value={"start": tip}) as fe:
+            self.assertEqual(kalshi.game_start(p), "2026-10-28T00:00:00+00:00")
+        self.assertEqual(fe.call_args[0][3], tip)                     # searched near 03:00Z - 3h
+        with mock.patch.object(espn, "find_event", return_value=None):
+            self.assertEqual(kalshi.game_start(p), "2026-10-28T00:00:00+00:00")  # estimate
+        with mock.patch.object(espn, "find_event", side_effect=OSError("down")):
+            self.assertEqual(kalshi.game_start(p), "2026-10-28T00:00:00+00:00")
+
     def test_two_letter_team_split(self):
         t, o = kalshi.split_teams("nba", "KXNBAPTS-26OCT28GSWNOP", "NOPZWILLIAMSON1", NBA)
         self.assertEqual((t["abbr"], o["abbr"]), ("NO", "GS"))
@@ -147,6 +159,16 @@ class Underdog(unittest.TestCase):
         game = {"abbreviated_title": "BARCA vs ALA", "home_team_id": "h", "away_team_id": "a"}
         self.assertEqual(underdog._sides(game, {"team_id": "a"}, {}), ("ALA", "BARCA"))
 
+    def test_started_games_are_dropped(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        live = Prop("kalshi", "nba", "points", "A", 9.5, start_time=(now - dt.timedelta(minutes=1)).isoformat())
+        soon = Prop("kalshi", "nba", "points", "B", 9.5, start_time=(now + dt.timedelta(minutes=5)).isoformat())
+        unknown = Prop("kalshi", "nba", "points", "C", 9.5)
+        with mock.patch.object(kalshi, "fetch_props", return_value=[live, soon, unknown]), \
+                mock.patch.object(underdog, "fetch_props", return_value=[]):
+            props, ok, _ = service.collect_sources()
+        self.assertEqual([p.player for p in props], ["B", "C"])
+
     def test_failed_source_is_skipped(self):
         with mock.patch.object(underdog, "fetch_props", side_effect=OSError("426")), \
                 mock.patch.object(kalshi, "fetch_props", return_value=[]):
@@ -189,17 +211,17 @@ class Picks(unittest.TestCase):
     def test_select_uses_espn_start(self):
         # Kalshi lists 03:00Z, ESPN tips at 00:00Z: within 2h of 23:00Z only by ESPN's time.
         tip = dt.datetime(2026, 10, 28, 0, 0, tzinfo=dt.timezone.utc)
-        with mock.patch.object(picks, "scoreboard", return_value=[event(tip)]):
+        with mock.patch.object(espn, "scoreboard", return_value=[event(tip)]):
             out = picks.select([board_row()], NOW)
             late = picks.select([board_row()], NOW - dt.timedelta(hours=1, minutes=1))
         self.assertEqual([(p["side"], p["event_id"], p["start_time"]) for p in out],
                          [("over", "401909878", "2026-10-28T00:00:00+00:00")])
         self.assertEqual(late, [])
-        with mock.patch.object(picks, "scoreboard", return_value=[event(tip, state="in")]):
+        with mock.patch.object(espn, "scoreboard", return_value=[event(tip, state="in")]):
             self.assertEqual(picks.select([board_row()], NOW), [])  # already started
 
     def test_select_skips_rows_without_ids(self):
-        with mock.patch.object(picks, "scoreboard", return_value=[]) as sb:
+        with mock.patch.object(espn, "scoreboard", return_value=[]) as sb:
             self.assertEqual(picks.select([board_row(market_id=None), board_row(athlete_id=None),
                                            board_row(error="player not found on ESPN roster")], NOW), [])
         sb.assert_not_called()
@@ -227,7 +249,7 @@ class Picks(unittest.TestCase):
             return []
 
         with mock.patch.object(picks.db, "query", side_effect=query), \
-                mock.patch.object(picks, "scoreboard", return_value=board), \
+                mock.patch.object(espn, "scoreboard", return_value=board), \
                 mock.patch.object(picks, "_player_game", side_effect=lambda l, a, s, e: games[e]):
             counts = picks.grade(tip + dt.timedelta(hours=7))
             self.assertEqual(counts, {"hit": 1, "void": 3})

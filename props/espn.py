@@ -5,6 +5,7 @@ These endpoints are unofficial and undocumented; everything here goes through
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
 import unicodedata
@@ -19,6 +20,7 @@ WEB = os.environ.get("ESPN_WEB_BASE", "https://site.web.api.espn.com/apis/common
 CURRENT_TTL = float(os.environ.get("PROPS_GAMELOG_TTL", 1800))
 PAST_TTL = 24 * 3600
 ROSTER_TTL = 6 * 3600
+ET = dt.timezone(dt.timedelta(hours=-5))  # ESPN scoreboard dates are US dates
 
 # Exchange/app abbreviations that differ from ESPN's and can't be found by prefix.
 TEAM_ALIASES = {
@@ -173,3 +175,39 @@ def player_games(league: str, athlete_id: str, stat: Stat, seasons_back: int = 2
             seen.add(g.event_id)
             out.append(g)
     return cur, out
+
+
+def parse_time(s: Optional[str]) -> Optional[dt.datetime]:
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def scoreboard(league: str, day: dt.date) -> list[dict]:
+    """ESPN events for one US date: id, start, state ("pre"/"in"/"post"), status name, team ids."""
+    data = net.get_json(f"{SITE}{LEAGUES[league]}/scoreboard", {"dates": day.strftime("%Y%m%d")}, ttl=60)
+    out = []
+    for e in data.get("events") or []:
+        comp = (e.get("competitions") or [{}])[0]
+        st = (e.get("status") or comp.get("status") or {}).get("type") or {}
+        out.append({"id": str(e["id"]), "start": parse_time(e.get("date")), "state": st.get("state"),
+                    "name": st.get("name") or "", "completed": bool(st.get("completed")),
+                    "teams": {str((c.get("team") or {}).get("id")) for c in comp.get("competitors") or []}})
+    return out
+
+
+def find_event(league: str, team_id: str, opponent_id: Optional[str], near: dt.datetime) -> Optional[dict]:
+    """The team's ESPN game closest to `near` on the surrounding US dates."""
+    day = near.astimezone(ET).date()
+    best = None
+    for d in (day - dt.timedelta(days=1), day, day + dt.timedelta(days=1)):
+        for e in scoreboard(league, d):
+            if team_id not in e["teams"] or (opponent_id and opponent_id not in e["teams"]) or not e["start"]:
+                continue
+            if best is None or abs(e["start"] - near) < abs(best["start"] - near):
+                best = e
+    return best

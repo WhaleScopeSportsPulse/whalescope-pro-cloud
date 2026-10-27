@@ -1,6 +1,7 @@
 """Join prop lines with player game logs and compute hit rates."""
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import threading
@@ -93,7 +94,14 @@ def collect_sources(sources: Iterable[str] = SOURCES, leagues: Optional[Iterable
         except Exception as e:
             log.warning("skipping %s this refresh: %s", src, e)
             errors[src] = str(e)
-    return props, ok, errors
+    now = dt.datetime.now(dt.timezone.utc)
+    return [p for p in props if not started(p.start_time, now)], ok, errors
+
+
+def started(start_time: Optional[str], now: dt.datetime) -> bool:
+    """True once the game has begun; props for started games leave the board."""
+    t = espn.parse_time(start_time)
+    return bool(t and t <= now)
 
 
 def collect(sources: Iterable[str] = SOURCES, leagues: Optional[Iterable[str]] = None) -> list[Prop]:
@@ -117,7 +125,8 @@ class Snapshot:
             rows = enrich(props)
             # Keep the last good rows for a source that failed this time.
             with self._lock:
-                rows += [r for r in self.rows if r["source"] in errors]
+                now = dt.datetime.now(dt.timezone.utc)
+                rows += [r for r in self.rows if r["source"] in errors and not started(r.get("start_time"), now)]
                 self.rows, self.updated = rows, time.time()
                 self.error = "; ".join(f"{k}: {v}" for k, v in errors.items()) or None
         except Exception as e:

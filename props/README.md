@@ -14,6 +14,7 @@ Regular season and playoffs count. Preseason and DNPs don't. A result exactly
 on a whole-number line is a push and stays out of the rate. Under rate = 1 − over rate.
 
 Kalshi or Underdog failing skips that source for the refresh; the other still loads.
+Props whose game has started are dropped from the board on the next refresh.
 
 Standard library only (Python 3.9+). No changes to Signal Lab.
 
@@ -38,7 +39,9 @@ takes about two minutes, mostly ESPN game-log lookups. Later ones mostly hit the
   open market in the per-game player series listed in `kalshi.py` (`KXNBAPTS`,
   `KXNFLRECYDS`, `KXMLBKS`, `KXNHLPTS`, …). Each `Player: N+` market becomes one
   prop with line `N − 0.5`. The price is the YES ask for over and the NO ask for under,
-  in dollars, which is also the implied probability.
+  in dollars, which is also the implied probability. Kalshi has no game-start field
+  (`occurrence_datetime` is about three hours after the start), so `start_time` is the
+  game's start on ESPN's scoreboard, or `occurrence_datetime` − 3 h when ESPN has no match.
 - **Underdog**: the open, unofficial `https://api.underdogfantasy.com/v1/over_under_lines` feed,
   read on every refresh. Each higher/lower line becomes one prop with league = Underdog's sport
   id lowercased (`nba`, `nfl`, `cfb`, `fifa`, `tennis`, `lol`, …; `basketball` is EuroLeague).
@@ -70,8 +73,7 @@ game starts within the next 2 hours and:
 - `0 < price < 1`, and `score` = lowest of the three rates − price is at least 0.10.
 
 `l5`/`l10`/`l20` and `price` are for the logged side (under rate = 1 − over rate). The start time
-and game come from ESPN's scoreboard, because Kalshi's `occurrence_datetime` runs about three
-hours after the real start. `stat`, `athlete_id` and `event_id` are kept for grading.
+and game come from ESPN's scoreboard. `stat`, `athlete_id` and `event_id` are kept for grading.
 
 Once ESPN marks the game final, the pick is graded from the player's ESPN game log: `hit` or
 `miss`, `push` when the stat equals the line, `void` when the player didn't play (no log entry

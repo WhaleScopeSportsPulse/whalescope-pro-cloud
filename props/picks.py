@@ -6,9 +6,8 @@ the next two hours and:
   - that side's hit rate is at least 0.70 in all three,
   - 0 < price < 1, and score = min(L5, L10, L20) - price >= 0.10.
 
-Start times come from ESPN's scoreboard, not the source: Kalshi's
-occurrence_datetime runs about three hours after tip-off. The ESPN event is
-stored with the pick and graded once ESPN marks it final: hit / miss, push
+The game and its start come from ESPN's scoreboard (the board's own start
+time only narrows the search). The ESPN event is stored with the pick and graded once ESPN marks it final: hit / miss, push
 when the stat lands on the line, void when the player didn't play or the
 game was postponed or canceled.
 """
@@ -32,7 +31,6 @@ FULL = (("l5", 5), ("l10", 10), ("l20", 20))
 # A final game missing from the player's log counts as did-not-play only after
 # this long, so a game log that ESPN hasn't updated yet isn't voided.
 DNP_AFTER = dt.timedelta(hours=6)
-ET = dt.timezone(dt.timedelta(hours=-5))  # ESPN scoreboard dates are US dates
 
 SCHEMA = [
     "CREATE SCHEMA IF NOT EXISTS props",
@@ -75,16 +73,6 @@ INSERT = (f"INSERT INTO props.picks_log ({_NAMES}) "
           "ON CONFLICT (market_id, side) DO NOTHING RETURNING id")
 
 
-def _when(s: Optional[str]) -> Optional[dt.datetime]:
-    if not s:
-        return None
-    try:
-        t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
-
-
 def side_rates(row: dict, side: str) -> Optional[dict]:
     """{"l5": r, "l10": r, "l20": r} for the side, or None unless every window is full."""
     out = {}
@@ -109,32 +97,6 @@ def qualifies(row: dict, side: str) -> Optional[dict]:
     return {**rates, "price": price, "score": score}
 
 
-def scoreboard(league: str, day: dt.date) -> list[dict]:
-    """ESPN events for one US date: id, start, state ("pre"/"in"/"post"), status name, team ids."""
-    data = net.get_json(f"{espn.SITE}{LEAGUES[league]}/scoreboard", {"dates": day.strftime("%Y%m%d")}, ttl=60)
-    out = []
-    for e in data.get("events") or []:
-        comp = (e.get("competitions") or [{}])[0]
-        st = (e.get("status") or comp.get("status") or {}).get("type") or {}
-        out.append({"id": str(e["id"]), "start": _when(e.get("date")), "state": st.get("state"),
-                    "name": st.get("name") or "", "completed": bool(st.get("completed")),
-                    "teams": {str((c.get("team") or {}).get("id")) for c in comp.get("competitors") or []}})
-    return out
-
-
-def find_event(league: str, team_id: str, opponent_id: Optional[str], near: dt.datetime) -> Optional[dict]:
-    """The team's ESPN game closest to `near` on the surrounding US dates."""
-    day = near.astimezone(ET).date()
-    best = None
-    for d in (day - dt.timedelta(days=1), day, day + dt.timedelta(days=1)):
-        for e in scoreboard(league, d):
-            if team_id not in e["teams"] or (opponent_id and opponent_id not in e["teams"]) or not e["start"]:
-                continue
-            if best is None or abs(e["start"] - near) < abs(best["start"] - near):
-                best = e
-    return best
-
-
 def select(rows: list[dict], now: Optional[dt.datetime] = None) -> list[dict]:
     """Pick records for rows that pass the rule and whose ESPN game starts within the next 2 hours."""
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -145,11 +107,11 @@ def select(rows: list[dict], now: Optional[dt.datetime] = None) -> list[dict]:
         sides = [(s, q) for s in ("over", "under") if (q := qualifies(r, s))]
         if not sides:
             continue
-        listed = _when(r.get("start_time"))
-        # Source times can be off by hours (Kalshi), so only use them to skip far-off games.
+        listed = espn.parse_time(r.get("start_time"))
+        # ESPN's scoreboard is the authority on the start; the board's time only skips far-off games.
         if not listed or not now - dt.timedelta(hours=6) <= listed <= now + WINDOW + dt.timedelta(hours=6):
             continue
-        ev = find_event(r["league"], r["team_id"], r.get("opponent_id"), listed)
+        ev = espn.find_event(r["league"], r["team_id"], r.get("opponent_id"), listed)
         if not ev or ev["state"] != "pre" or not now <= ev["start"] <= now + WINDOW:
             continue
         for side, q in sides:
@@ -207,10 +169,10 @@ def grade(now: Optional[dt.datetime] = None, url: Optional[str] = None, limit: i
     for p in rows:
         start = dt.datetime.fromtimestamp(float(p["start"]), dt.timezone.utc)
         try:
-            key = (p["league"], start.astimezone(ET).date())
+            key = (p["league"], start.astimezone(espn.ET).date())
             if key not in boards:
                 boards[key] = {e["id"]: e for d in (key[1] - dt.timedelta(days=1), key[1])
-                               for e in scoreboard(p["league"], d)}
+                               for e in espn.scoreboard(p["league"], d)}
             ev = boards[key].get(p["event_id"])
             if ev is None:
                 continue
