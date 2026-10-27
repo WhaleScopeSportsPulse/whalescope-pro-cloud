@@ -230,12 +230,13 @@ def cashout_signal(direction,yes_ask,no_ask,conflict,yes_bid=None,no_bid=None):
 
 OBSERVE_SECONDS=max(3,int(os.getenv("SIGNAL_LAB_OBSERVE_SECONDS","5")))
 def find_market(now):
- # Search the paginated market list for the currently trading 15-minute round.
- # Kalshi's first page may contain only future contracts, so do not treat it as exhaustive.
+ # Search the market list for the currently trading 15-minute round. Filter by close
+ # time, not status=open: for ~20 s after rollover status=open still returns the
+ # closed round, while the close-time filter lists the new round within ~5 s.
  candidates=[]
  cursor=""
  for page in range(12):
-  url=BASE+"markets?series_ticker=KXBTC15M&status=open&limit=200"
+  url=BASE+"markets?series_ticker=KXBTC15M&min_close_ts="+str(now)+"&max_close_ts="+str(now+1200)+"&limit=200"
   if cursor:url+="&cursor="+urllib.parse.quote(cursor,safe="")
   response=fetch(url)
   for item in response.get("markets",[]):
@@ -438,7 +439,9 @@ def cycle():
      S.update(status="MARKET UNAVAILABLE",error=str(e),btc=prices.get("kraken",next(iter(prices.values())) if prices else None),quotes=prices,updated=int(time.time()),locked="ANALYZING",strength="Kalshi market feed unavailable; no prediction",target=None,remaining=None)
    except Exception as spot_ex:
     with L:S.update(status="FEED ERROR",error=str(e)+"; spot: "+str(spot_ex))
-   time.sleep(10 if "429" in str(e) else 14)
+   # A missing round is usually the rollover itself; retry quickly so the round's
+   # first seconds are recorded.
+   time.sleep(10 if "429" in str(e) else 1 if "currently trading" in str(e) else 14)
   # One single-market request per tick; sleep only the remainder of the interval.
   time.sleep(max(0.5,OBSERVE_SECONDS-(time.time()-tick)))
 HTML='''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090e18"><title>Signal Lab</title><style>
