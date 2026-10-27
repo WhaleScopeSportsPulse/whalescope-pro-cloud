@@ -30,7 +30,7 @@ No Signal Lab tables were touched.
 | --- | --- |
 | **Kalshi** (`api.elections.kalshi.com`) | ✅ HTTP 200. 3,029 open player-prop markets across NBA, NFL, MLB and NHL. |
 | **Player stats** (ESPN `site.api.espn.com`, `site.web.api.espn.com`) | ✅ HTTP 200. 3,028 of 3,029 props matched to a game log. One miss: Dante Fabbro (NHL, goals 0.5), "player not found on ESPN roster". |
-| **Underdog** | ❌ **No data.** The service doesn't fetch Underdog by design: it has no official public API, so lines come from CSV/JSON import (`import-underdog` or `POST /api/underdog`), and nothing was imported. A probe of `api.underdogfantasy.com/beta/v5/over_under_lines` returned **HTTP 426 Upgrade Required**: the host was reachable but refused the request. |
+| **Underdog** | ❌ **No data.** The service doesn't fetch Underdog by design: it has no official public API, so lines come from CSV/JSON import (`import-underdog` or `POST /api/underdog`), and nothing was imported. Underdog is **not blocked**. A probe of `api.underdogfantasy.com/beta/v5/over_under_lines` returned HTTP 426 "Upgrade required", but `api.underdogfantasy.com/v1/over_under_lines` returned **HTTP 200**. Pulling from that unofficial endpoint would be a deliberate change to the service's design. |
 
 No host was blocked by the network policy. The only failure was direct Postgres on port 5432
 (see above).
