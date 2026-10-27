@@ -3,7 +3,6 @@
     python -m props serve                      # JSON API + web table on $PORT (default 8080)
     python -m props slate --league nba --window l10 --min-rate 0.7
     python -m props player --league nba --name "Zach LaVine" --stat points --line 24.5 --opponent SA
-    python -m props import-underdog lines.csv
     python -m props load                       # one refresh, written to props.props_board ($DATABASE_URL)
 """
 from __future__ import annotations
@@ -17,7 +16,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import espn, service, underdog
+from . import espn, service
 from .props import Prop
 from .stats import LEAGUES, STATS, resolve
 
@@ -67,37 +66,19 @@ class Handler(BaseHTTPRequestHandler):
                                min_games=int(q.get("min_games", 0)), side=q.get("side", "over"),
                                limit=int(q.get("limit", 500)))
                 return self._send(200, {"updated": s.updated, "refreshing_error": s.error,
+                                        "leagues": sorted({r["league"] for r in s.rows}),
                                         "count": len(rows), "props": rows})
             if u.path == "/api/player":
                 return self._send(200, player_report(q["league"].lower(), q["name"], q["stat"], float(q["line"]),
                                                      q.get("team"), q.get("opponent")))
             if u.path == "/api/stats":
                 return self._send(200, [{"league": l, "key": k, "label": s.label} for (l, k), s in STATS.items()])
-            if u.path == "/api/underdog":
-                return self._send(200, underdog.load())
             self._send(404, {"error": "not found"})
         except (KeyError, ValueError) as e:
             self._send(400, {"error": f"bad request: {e}"})
         except Exception as e:
             logging.exception("request failed")
             self._send(502, {"error": str(e)})
-
-    def do_POST(self) -> None:
-        if urllib.parse.urlparse(self.path).path != "/api/underdog":
-            return self._send(404, {"error": "not found"})
-        token = os.environ.get("PROPS_ADMIN_TOKEN")
-        if token and self.headers.get("Authorization") != f"Bearer {token}":
-            return self._send(401, {"error": "unauthorized"})
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 5_000_000:
-            return self._send(413, {"error": "too large"})
-        try:
-            rows, errors = underdog.parse(self.rfile.read(n).decode("utf-8-sig"))
-        except Exception as e:
-            return self._send(400, {"error": f"could not parse: {e}"})
-        underdog.save(rows)
-        self.snapshot.kick()
-        self._send(200, {"imported": len(rows), "errors": errors})
 
     def log_message(self, fmt, *args) -> None:
         logging.info("%s - %s", self.address_string(), fmt % args)
@@ -113,8 +94,8 @@ def main(argv=None) -> int:
     sv.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
 
     sl = sub.add_parser("slate", help="print the current slate with hit rates")
-    sl.add_argument("--source", choices=["kalshi", "underdog"], action="append")
-    sl.add_argument("--league", choices=sorted(LEAGUES), action="append")
+    sl.add_argument("--source", choices=service.SOURCES, action="append")
+    sl.add_argument("--league", action="append", help="nba, nfl, ... or any Underdog sport (cfb, fifa, tennis)")
     sl.add_argument("--stat")
     sl.add_argument("--window", default="l10", choices=service.WINDOW_KEYS)
     sl.add_argument("--side", default="over", choices=["over", "under"])
@@ -131,11 +112,8 @@ def main(argv=None) -> int:
     pl.add_argument("--team")
     pl.add_argument("--opponent")
 
-    im = sub.add_parser("import-underdog", help="load Underdog lines from a CSV/JSON file ('-' for stdin)")
-    im.add_argument("file")
-
     ld = sub.add_parser("load", help="refresh once and replace props.props_board in $DATABASE_URL")
-    ld.add_argument("--league", choices=sorted(LEAGUES), action="append")
+    ld.add_argument("--league", action="append")
     ld.add_argument("--from-json", help="load rows saved by `slate --json` instead of fetching")
 
     a = ap.parse_args(argv)
@@ -146,7 +124,7 @@ def main(argv=None) -> int:
         logging.info("props service on http://%s:%d", a.host, a.port)
         ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
     elif a.cmd == "slate":
-        rows = service.enrich(service.collect(a.source or ("kalshi", "underdog"), a.league))
+        rows = service.enrich(service.collect(a.source or service.SOURCES, a.league))
         rows = service.filter_rows(rows, stat=a.stat, window=a.window, min_rate=a.min_rate,
                                    min_games=a.min_games, side=a.side, limit=a.limit)
         if a.json:
@@ -161,18 +139,16 @@ def main(argv=None) -> int:
             print("DATABASE_URL is not set", file=sys.stderr)
             return 2
         if a.from_json:
-            rows = json.load(open(a.from_json))
+            rows, ok = json.load(open(a.from_json)), service.SOURCES
         else:
-            rows = service.enrich(service.collect(leagues=a.league))
-        n = db.save(rows, ("kalshi", "underdog"), a.league)
-        print(f"saved {n} props to props.props_board")
-    elif a.cmd == "import-underdog":
-        text = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8-sig").read()
-        rows, errors = underdog.parse(text)
-        underdog.save(rows)
-        print(f"imported {len(rows)} lines into {underdog.STORE}")
-        for e in errors:
-            print("  skipped", e, file=sys.stderr)
+            props, ok, errors = service.collect_sources(leagues=a.league)
+            for src, err in errors.items():
+                print(f"skipped {src}: {err}", file=sys.stderr)
+            if not ok:
+                return 1
+            rows = service.enrich(props)
+        n = db.save(rows, ok, a.league)
+        print(f"saved {n} props to props.props_board ({', '.join(ok)})")
     return 0
 
 

@@ -1,66 +1,88 @@
-# Props service: pre-deploy load report
+# Props service: load and deploy report
 
-Run on 2026-10-27, ~17:20 UTC, from branch `claude/outlier-props-service-qo8o83` (commit `c5a738e`)
-plus the database writer added in this change. Network access: Full.
+Branch `claude/outlier-props-service-qo8o83-r1kdmf`. Last load: 2026-10-27, ~18:10 UTC, run from
+the build container against Neon.
 
-## 1. DATABASE_URL
+## Database
 
-**Set and connected.** It points at Neon database `neondb` (role `neondb_owner`, pooler endpoint
-in `us-east-2`).
+`DATABASE_URL` connects to Neon `neondb`. Writes use Neon's HTTPS SQL endpoint because outbound
+port 5432 is blocked in the build container.
 
-- Direct Postgres on port 5432 **timed out** from the build container, because outbound traffic
-  goes through an HTTPS proxy. Render does not have this limit.
-- Neon's HTTPS SQL endpoint (`https://<host>/sql`) **worked** with the same `DATABASE_URL`, so
-  the writer uses it. That keeps the props package stdlib-only and works in both places.
+`props.props_board` is created on first save. Each save replaces only the rows for the sources
+that loaded, in one transaction.
 
-Before this run, Neon had only the `public.signal_lab_*` tables. **`props.props_board` did not
-exist, and the props service had no database code.** This change adds:
+## Sources
 
-- `props/db.py`. It creates `props` / `props.props_board` if needed, then replaces rows for the
-  given sources and leagues in one transaction.
-- `python -m props load`, which runs one refresh and saves it.
-- An automatic save after every background refresh in `python -m props serve` when `DATABASE_URL`
-  is set.
-
-No Signal Lab tables were touched.
-
-## 2. Sources
-
-| Source | Result |
+| Source | Status |
 | --- | --- |
-| **Kalshi** (`api.elections.kalshi.com`) | ✅ HTTP 200. 3,029 open player-prop markets across NBA, NFL, MLB and NHL. |
-| **Player stats** (ESPN `site.api.espn.com`, `site.web.api.espn.com`) | ✅ HTTP 200. 3,028 of 3,029 props matched to a game log. One miss: Dante Fabbro (NHL, goals 0.5), "player not found on ESPN roster". |
-| **Underdog** | ❌ **No data.** The service doesn't fetch Underdog by design: it has no official public API, so lines come from CSV/JSON import (`import-underdog` or `POST /api/underdog`), and nothing was imported. Underdog is **not blocked**. A probe of `api.underdogfantasy.com/beta/v5/over_under_lines` returned HTTP 426 "Upgrade required", but `api.underdogfantasy.com/v1/over_under_lines` returned **HTTP 200**. Pulling from that unofficial endpoint would be a deliberate change to the service's design. |
+| Kalshi (official public API) | ✅ Loaded |
+| Underdog (`api.underdogfantasy.com/v1/over_under_lines`, unofficial) | ✅ Loaded on every refresh. If it fails, Underdog is skipped, Kalshi still loads, and the last good Underdog rows stay in the table. |
+| ESPN player stats | ✅ Loaded. A few players aren't on ESPN rosters (e.g. Dante Fabbro, Deuce McBride). |
 
-No host was blocked by the network policy. The only failure was direct Postgres on port 5432
-(see above).
+How Underdog rows are stored:
 
-WNBA returned no Kalshi markets (off-season).
+- **League:** Underdog's sport id, lowercased. `fifa` is soccer (EPL, La Liga, Serie A, Ligue 1),
+  `basketball` is EuroLeague, and `lol` / `cs` / `val` are esports.
+- **Prices:** each option's `american_price`, converted to implied probability. A side Underdog
+  doesn't offer is null. About half the lines have no "lower" side, and every soccer line is
+  higher-only.
+- **URL:** `https://underdogfantasy.com/pick-em/higher-lower/all/<league>`.
+- **Hit rates:** filled for NBA, WNBA, NFL, MLB and NHL stats that ESPN covers. Other leagues and
+  stats (fantasy points, 1H/1Q, anytime TD, etc.) keep Underdog's own stat key and label, and their
+  hit-rate columns are empty.
 
-## 3. Rows in `props.props_board`
+## Rows in `props.props_board`
 
-| Sport | Source | Rows | With hit rates |
-| --- | --- | ---: | ---: |
-| MLB | kalshi | 197 | 197 |
-| NBA | kalshi | 821 | 821 |
-| NFL | kalshi | 387 | 387 |
-| NHL | kalshi | 1,624 | 1,623 |
-| **Total** | | **3,029** | **3,028** |
+| Sport | Underdog | Underdog with hit rates | Kalshi |
+| --- | ---: | ---: | ---: |
+| nfl | 2,042 | 382 | 387 |
+| nhl | 1,778 | 1,050 | 1,634 |
+| cfb | 1,030 | — | — |
+| fifa (soccer) | 916 | — | — |
+| nba | 448 | 371 | 836 |
+| tennis | 420 | — | — |
+| lol | 180 | — | — |
+| mlb | 164 | 123 | 197 |
+| basketball (EuroLeague) | 131 | — | — |
+| wnba | 70 | 62 | — |
+| cs | 68 | — | — |
+| mma | 44 | — | — |
+| val | 36 | — | — |
+| **Total** | **7,327** | **1,988** | **3,054** |
 
-Underdog: 0 rows in every sport. WNBA: 0 rows.
+## Memory fix
 
-I loaded the board twice: once from a saved `slate --json` run, then with a full live
-`python -m props load` (about 1m52s). Both gave the same counts. Sample row: Cade Cunningham
-(DET vs NY), Assists 3.5, Kalshi YES ask $0.96. L5/L10 100%, L20 95%, H2H 12/13.
+A full refresh used to peak at **3 GB**, because every raw ESPN game-log response was cached.
+Parsed game logs are now cached instead, and the 20 MB Underdog feed is not cached. Peak memory is
+now **230 MB** for a cold refresh and **340 MB** for a warm one, under Render's 512 MB limit on
+the Free and Starter plans.
 
-## Before deploying
+A refresh takes about 1m45s from cold and about 35s warm.
 
-- Deploy a branch that has `props/db.py`. `claude/outlier-props-service-qo8o83` on its own has no
-  database writes. This work is on `claude/outlier-props-service-qo8o83-r1kdmf`, a fast-forward of
-  that branch.
-- Set `DATABASE_URL` on the Render service. Optionally set `PROPS_ADMIN_TOKEN` to protect Underdog
-  imports.
-- To get Underdog rows, import a slate. They then appear as `source = 'underdog'` on the next
-  refresh.
-- `props/data/` (Underdog imports) is on local disk and is lost on Render redeploys unless a disk
-  is attached.
+## Render deploy: not done (needs payment)
+
+A free-tier deploy that refreshes every 10–15 minutes isn't possible in this workspace:
+
+- **Render cron jobs have no free plan.**
+- **A free web service sleeps** after 15 minutes without inbound traffic, and the refresh loop
+  stops while it sleeps. Keeping it awake would use about 744 of the workspace's **750 free
+  instance hours per month**.
+- **`signal-lab-pro` already uses about the same.** It is kept awake around the clock by the paid
+  `signal-lab-5min-healthcheck` cron job. Running both all month would exceed the 750 hours, and
+  Render then **suspends every free web service in the workspace** (`signal-lab-live`,
+  `signal-lab-pro`, …) until the next month.
+
+Options:
+
+| Option | Cost |
+| --- | --- |
+| **Render cron job** (Starter, 512 MB, $0.00016/min) running `python -m props load` every 12–15 min. Each run is a cold refresh, about 2–2.5 min including startup. | About **$1.15–1.45 / month** (7,200–9,000 run-minutes; $1/month minimum) |
+| **Starter web service** (always on, serves the board, saves on each refresh) | **$7 / month** |
+| Free web service with no keep-awake | $0, but it only refreshes while someone has the page open, so it doesn't meet the 10–15 minute requirement |
+
+Settings to use for either paid option:
+
+- **Build command:** `true` (stdlib only)
+- **Start command:** `python -m props load` (cron), or `python -m props serve` with
+  `PROPS_REFRESH_SECONDS=720` (web)
+- **Environment:** `DATABASE_URL`

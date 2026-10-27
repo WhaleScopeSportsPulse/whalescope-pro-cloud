@@ -1,6 +1,7 @@
 import unittest
+from unittest import mock
 
-from props import espn, kalshi, underdog
+from props import espn, kalshi, service, underdog
 from props.espn import Game, parse_gamelog
 from props.hitrate import hit_rates, window
 from props.stats import get, resolve
@@ -86,20 +87,69 @@ class Kalshi(unittest.TestCase):
         self.assertEqual((t["abbr"], o["abbr"]), ("NO", "GS"))
 
 
-class Underdog(unittest.TestCase):
-    def test_csv(self):
-        rows, errors = underdog.parse(
-            "league,player,team,opponent,stat,line\n"
-            "NBA,Jalen Brunson,NYK,DET,Points,26.5\n"
-            "nba,Someone,NYK,DET,Fantasy Points,40\n"
-            "nfl,Josh Allen,BUF,MIA,Passing Yards,abc\n")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0]["stat"], rows[0]["line"], rows[0]["team"]), ("points", 26.5, "NYK"))
-        self.assertEqual(len(errors), 2)
+UD_FEED = {
+    "games": [{"id": 1, "sport_id": "NBA", "abbreviated_title": "NY @ DET", "away_team_id": "t-ny",
+               "home_team_id": "t-det", "scheduled_at": "2026-10-28T23:00:00Z"}],
+    "solo_games": [{"id": 2, "sport_id": "TENNIS", "home_player_id": "p-tf", "home_player_name": "(6) Taylor Fritz",
+                    "away_player_id": "p-rh", "away_player_name": "Rinky Hijikata",
+                    "scheduled_at": "2026-10-28T17:00:00Z"}],
+    "players": [{"id": "p-jb", "first_name": "Jalen", "last_name": "Brunson", "sport_id": "NBA", "team_id": "t-ny"},
+                {"id": "p-rh", "first_name": "Rinky", "last_name": "Hijikata", "sport_id": "TENNIS"}],
+    "appearances": [{"id": "a-jb", "player_id": "p-jb", "match_id": 1, "team_id": "t-ny"},
+                    {"id": "a-rh", "player_id": "p-rh", "match_id": 2}],
+    "over_under_lines": [
+        {"id": "l1", "status": "active", "stat_value": "26.5",
+         "over_under": {"appearance_stat": {"appearance_id": "a-jb", "stat": "points", "display_stat": "Points "}},
+         "options": [{"choice": "higher", "american_price": "+102"}, {"choice": "lower", "american_price": "-139"}]},
+        {"id": "l2", "status": "active", "stat_value": "40.5",
+         "over_under": {"appearance_stat": {"appearance_id": "a-jb", "stat": "fantasy_points",
+                                            "display_stat": "Fantasy Points"}},
+         "options": [{"choice": "higher", "american_price": ""}]},
+        {"id": "l3", "status": "active", "stat_value": "9.5",
+         "over_under": {"appearance_stat": {"appearance_id": "a-rh", "stat": "games_won", "display_stat": "Games Won"}},
+         "options": [{"choice": "higher", "american_price": "-120"}, {"choice": "lower", "american_price": "-110"}]},
+    ],
+}
 
-    def test_json(self):
-        rows, errors = underdog.parse('[{"league":"nhl","player":"Kirill Kaprizov","stat":"Shots","line":3.5}]')
-        self.assertEqual((rows[0]["stat"], errors), ("shots", []))
+
+class Underdog(unittest.TestCase):
+    def test_implied(self):
+        self.assertEqual(underdog.implied("+102"), 0.495)
+        self.assertEqual(underdog.implied("-139"), 0.5816)
+        self.assertEqual(underdog.implied("+100"), 0.5)
+        self.assertIsNone(underdog.implied(""))
+        self.assertIsNone(underdog.implied(None))
+
+    def test_parse_feed(self):
+        with mock.patch.object(espn, "teams", return_value=NBA):
+            props = {p.market_id: p for p in underdog.parse(UD_FEED)}
+        p = props["l1"]
+        self.assertEqual((p.source, p.league, p.stat, p.player, p.line), ("underdog", "nba", "points", "Jalen Brunson", 26.5))
+        self.assertEqual((p.team, p.team_id, p.opponent, p.opponent_id), ("NY", "9", "DET", "4"))
+        self.assertEqual((p.over_price, p.under_price), (0.495, 0.5816))
+        self.assertEqual(p.url, "https://underdogfantasy.com/pick-em/higher-lower/all/nba")
+        f = props["l2"]  # NBA stat ESPN doesn't cover: own key + label, no odds
+        self.assertEqual((f.stat, f.stat_label, f.over_price, f.under_price),
+                         ("fantasy_points", "Fantasy Points", None, None))
+        t = props["l3"]
+        self.assertEqual((t.league, t.stat, t.opponent, t.team), ("tennis", "games_won", "Taylor Fritz", None))
+
+    def test_enrich_skips_unsupported(self):
+        with mock.patch.object(espn, "teams", return_value=NBA):
+            props = underdog.parse(UD_FEED, leagues=["tennis"])
+        rows = service.enrich(props)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["stat_label"], rows[0]["error"], rows[0].get("l10")), ("Games Won", None, None))
+
+    def test_home_vs_away_title(self):
+        game = {"abbreviated_title": "BARCA vs ALA", "home_team_id": "h", "away_team_id": "a"}
+        self.assertEqual(underdog._sides(game, {"team_id": "a"}, {}), ("ALA", "BARCA"))
+
+    def test_failed_source_is_skipped(self):
+        with mock.patch.object(underdog, "fetch_props", side_effect=OSError("426")), \
+                mock.patch.object(kalshi, "fetch_props", return_value=[]):
+            props, ok, errors = service.collect_sources()
+        self.assertEqual((props, ok, list(errors)), ([], ["kalshi"], ["underdog"]))
 
 
 class Gamelog(unittest.TestCase):

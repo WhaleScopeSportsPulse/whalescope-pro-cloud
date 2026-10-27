@@ -11,7 +11,7 @@ from typing import Iterable, Optional
 from . import espn, kalshi, underdog
 from .hitrate import hit_rates
 from .props import Prop
-from .stats import get as get_stat
+from .stats import STATS, get as get_stat
 
 log = logging.getLogger("props")
 WORKERS = int(os.environ.get("PROPS_WORKERS", 6))
@@ -30,7 +30,11 @@ def _resolve_player(p: Prop) -> Optional[dict]:
 def enrich(props: list[Prop]) -> list[dict]:
     """One output row per prop; players and game logs are fetched once per player."""
     groups: dict[tuple, list[Prop]] = {}
+    bare: list[Prop] = []  # league or stat ESPN doesn't cover: no hit rates
     for p in props:
+        if (p.league, p.stat) not in STATS:
+            bare.append(p)
+            continue
         cat = get_stat(p.league, p.stat).category
         groups.setdefault((p.league, p.player.lower(), p.team_id, cat), []).append(p)
 
@@ -55,13 +59,13 @@ def enrich(props: list[Prop]) -> list[dict]:
         return out
 
     with ThreadPoolExecutor(WORKERS) as ex:
-        return [r for rows in ex.map(work, groups.values()) for r in rows]
+        return [r for rows in ex.map(work, groups.values()) for r in rows] + [_row(p) for p in bare]
 
 
 def _row(p: Prop, athlete_id: Optional[str] = None, rates: Optional[dict] = None,
          error: Optional[str] = None) -> dict:
     d = p.to_dict()
-    d["stat_label"] = get_stat(p.league, p.stat).label
+    d["stat_label"] = p.stat_label or get_stat(p.league, p.stat).label
     d["athlete_id"] = athlete_id
     d["error"] = error
     if rates:
@@ -72,14 +76,28 @@ def _row(p: Prop, athlete_id: Optional[str] = None, rates: Optional[dict] = None
     return d
 
 
-def collect(sources: Iterable[str] = ("kalshi", "underdog"), leagues: Optional[Iterable[str]] = None) -> list[Prop]:
+SOURCES = ("kalshi", "underdog")
+
+
+def collect_sources(sources: Iterable[str] = SOURCES, leagues: Optional[Iterable[str]] = None
+                    ) -> tuple[list[Prop], list[str], dict[str, str]]:
+    """(props, sources that loaded, {source: error}). One failing source doesn't stop the others."""
     want = {l.lower() for l in leagues} if leagues else None
+    fetchers = {"kalshi": kalshi.fetch_props, "underdog": underdog.fetch_props}
     props: list[Prop] = []
-    if "kalshi" in sources:
-        props += kalshi.fetch_props(want)
-    if "underdog" in sources:
-        props += [p for p in underdog.to_props() if not want or p.league in want]
-    return props
+    ok, errors = [], {}
+    for src in sources:
+        try:
+            props += fetchers[src](want)
+            ok.append(src)
+        except Exception as e:
+            log.warning("skipping %s this refresh: %s", src, e)
+            errors[src] = str(e)
+    return props, ok, errors
+
+
+def collect(sources: Iterable[str] = SOURCES, leagues: Optional[Iterable[str]] = None) -> list[Prop]:
+    return collect_sources(sources, leagues)[0]
 
 
 class Snapshot:
@@ -93,9 +111,15 @@ class Snapshot:
 
     def refresh(self) -> None:
         try:
-            rows = enrich(collect(leagues=self.leagues))
+            props, ok, errors = collect_sources(leagues=self.leagues)
+            if not ok:
+                raise RuntimeError("; ".join(f"{k}: {v}" for k, v in errors.items()))
+            rows = enrich(props)
+            # Keep the last good rows for a source that failed this time.
             with self._lock:
-                self.rows, self.updated, self.error = rows, time.time(), None
+                rows += [r for r in self.rows if r["source"] in errors]
+                self.rows, self.updated = rows, time.time()
+                self.error = "; ".join(f"{k}: {v}" for k, v in errors.items()) or None
         except Exception as e:
             log.exception("refresh failed")
             self.error = str(e)
@@ -103,7 +127,7 @@ class Snapshot:
         if os.environ.get("DATABASE_URL"):
             from . import db
             try:
-                db.save(rows, ("kalshi", "underdog"), self.leagues)
+                db.save([r for r in rows if r["source"] in ok], ok, self.leagues)
             except Exception as e:
                 log.exception("saving props_board failed")
                 self.error = f"db: {e}"

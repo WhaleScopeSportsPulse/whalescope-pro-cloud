@@ -62,9 +62,29 @@ def get_json(url: str, params: dict | None = None, ttl: float = 0, timeout: floa
     else:
         raise last  # type: ignore[misc]
     if ttl:
-        with _lock:
-            _cache[url] = (now + ttl, data)
+        _store(url, now + ttl, data)
     return data
+
+
+def _store(key: str, expires: float, value: object) -> None:
+    with _lock:
+        _cache[key] = (expires, value)
+        if len(_cache) % 500 == 0:  # drop expired entries now and then
+            now = time.time()
+            for k in [k for k, (exp, _) in _cache.items() if exp <= now]:
+                del _cache[k]
+
+
+def memo(key: str, ttl: float, fn):
+    """Cache fn()'s result under key for ttl seconds (shares get_json's cache)."""
+    now = time.time()
+    with _lock:
+        hit = _cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    value = fn()
+    _store(key, now + ttl, value)
+    return value
 
 
 def clear_cache() -> None:

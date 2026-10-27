@@ -9,7 +9,7 @@ from typing import Optional
 class Prop:
     source: str                     # "kalshi" | "underdog"
     league: str                     # nba, wnba, nfl, mlb, nhl
-    stat: str                       # key in stats.STATS
+    stat: str                       # key in stats.STATS, or the source's own key when unsupported
     player: str
     line: float                     # over = stat > line
     team: Optional[str] = None      # ESPN abbreviation
@@ -21,6 +21,7 @@ class Prop:
     over_price: Optional[float] = None   # Kalshi: YES ask in dollars (= implied prob.)
     under_price: Optional[float] = None  # Kalshi: NO ask
     url: Optional[str] = None
+    stat_label: Optional[str] = None     # set only for stats not in stats.STATS
 
     def to_dict(self) -> dict:
         return asdict(self)

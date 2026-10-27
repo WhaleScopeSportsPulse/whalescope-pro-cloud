@@ -113,14 +113,17 @@ def find_player(league: str, name: str, team_ids: list[str]) -> Optional[dict]:
 
 def gamelog(league: str, athlete_id: str, season: int, category: Optional[str], is_current: bool) -> list[Game]:
     url = f"{WEB}{LEAGUES[league]}/athletes/{athlete_id}/gamelog"
-    try:
-        data = net.get_json(url, {"season": season, "category": category},
-                            ttl=CURRENT_TTL if is_current else PAST_TTL)
-    except Exception as e:  # 404 for seasons a player didn't play
-        if getattr(e, "code", None) in (400, 404):
-            return []
-        raise
-    return parse_gamelog(data, season)
+
+    def fetch() -> list[Game]:
+        try:
+            data = net.get_json(url, {"season": season, "category": category})
+        except Exception as e:  # 404 for seasons a player didn't play
+            if getattr(e, "code", None) in (400, 404):
+                return []
+            raise
+        return parse_gamelog(data, season)
+    # Cache parsed games, not ESPN's much larger raw JSON.
+    return net.memo(f"gamelog:{url}:{season}:{category}", CURRENT_TTL if is_current else PAST_TTL, fetch)
 
 
 def parse_gamelog(data: dict, season: int) -> list[Game]:

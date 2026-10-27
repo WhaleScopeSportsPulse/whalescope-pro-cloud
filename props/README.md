@@ -13,6 +13,8 @@ reports how often they went over the line in the:
 Regular season and playoffs count. Preseason and DNPs don't. A result exactly
 on a whole-number line is a push and stays out of the rate. Under rate = 1 − over rate.
 
+Kalshi or Underdog failing skips that source for the refresh; the other still loads.
+
 Standard library only (Python 3.9+). No changes to Signal Lab.
 
 ## Run it
@@ -22,7 +24,6 @@ python -m props serve                    # web board + JSON API on $PORT (defaul
 python -m props slate --league nba --window l10 --min-rate 0.7
 python -m props slate --source underdog --side under --window h2h
 python -m props player --league nba --name "Zach LaVine" --stat points --line 22.5 --opponent SAS
-python -m props import-underdog lines.csv
 python -m props load                     # refresh once and write props.props_board ($DATABASE_URL)
 python -m unittest discover -s props/tests -t .
 ```
@@ -38,18 +39,13 @@ takes about two minutes, mostly ESPN game-log lookups. Later ones mostly hit the
   `KXNFLRECYDS`, `KXMLBKS`, `KXNHLPTS`, …). Each `Player: N+` market becomes one
   prop with line `N − 0.5`. The price is the YES ask for over and the NO ask for under,
   in dollars, which is also the implied probability.
-- **Underdog**: Underdog has no official public API, so the service doesn't call or
-  scrape it. Import the lines you see in the app as CSV or JSON:
-
-  ```csv
-  league,player,team,opponent,stat,line,start_time
-  nba,Jalen Brunson,NYK,DET,Pts + Rebs + Asts,34.5,
-  nfl,Josh Jacobs,GB,CAR,Rush + Rec Yards,84.5,
-  ```
-
-  Use the CLI, or `POST /api/underdog` with the file as the body. Each import
-  replaces the stored slate. Set `PROPS_ADMIN_TOKEN` to require `Authorization: Bearer <token>`.
-  `stat` accepts Underdog's labels or the keys in `stats.py`.
+- **Underdog**: the open, unofficial `https://api.underdogfantasy.com/v1/over_under_lines` feed,
+  read on every refresh. Each higher/lower line becomes one prop with league = Underdog's sport
+  id lowercased (`nba`, `nfl`, `cfb`, `fifa`, `tennis`, `lol`, …; `basketball` is EuroLeague).
+  Prices are the options' American odds converted to implied probability; a side Underdog
+  doesn't offer is null. Lines in leagues or stats ESPN doesn't cover are kept with Underdog's
+  own stat key and label and no hit rates. The feed is undocumented and can change or refuse
+  requests; when it fails the refresh skips Underdog and keeps its last good rows.
 - **Stats**: ESPN's public site API for team rosters and player game logs. Kalshi lists
   ESPN as a settlement source. These endpoints are undocumented and could change.
 
@@ -77,7 +73,6 @@ NHL: goals, assists, points, shots, saves.
 | `GET /` | Web board with filters and a last-10 bar chart |
 | `GET /api/props` | `league`, `source`, `stat`, `player`, `window` (l5/l10/l20/season/h2h), `side` (over/under), `min_rate`, `min_games`, `limit`. Sorted by the window's rate. |
 | `GET /api/player` | `league`, `name`, `stat`, `line`, optional `team`, `opponent` |
-| `GET/POST /api/underdog` | Read or replace imported Underdog lines |
 | `GET /api/stats` | Supported stat keys per league |
 | `GET /health` | Slate size, last refresh, last error |
 
@@ -96,8 +91,6 @@ Each prop row has `l5`, `l10`, `l20`, `season`, `h2h` (`games`, `over`, `under`,
 | `PROPS_KALSHI_TTL` | `60` |
 | `PROPS_WORKERS` | `6` concurrent player lookups |
 | `PROPS_H2H_SEASONS_BACK` | `2` |
-| `PROPS_DATA_DIR` | `props/data` (Underdog imports) |
-| `PROPS_ADMIN_TOKEN` | unset (imports open) |
 | `DATABASE_URL` | unset (no database writes) |
 | `KALSHI_BASE` | `https://api.elections.kalshi.com/trade-api/v2/` |
 
