@@ -171,6 +171,8 @@ class Snapshot:
             from . import db
             try:
                 db.save([r for r in rows if r["source"] in ok], ok, self.leagues)
+                if errors:
+                    db.drop_started(errors)
             except Exception as e:
                 log.exception("saving props_board failed")
                 self.error = f"db: {e}"

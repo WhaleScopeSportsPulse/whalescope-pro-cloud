@@ -13,7 +13,7 @@ _cache: dict[str, tuple[float, object]] = {}
 _lock = threading.Lock()
 # Minimum seconds between requests to one host, so a full slate refresh
 # stays under public rate limits.
-MIN_INTERVAL = {"api.elections.kalshi.com": 0.25}
+MIN_INTERVAL = {"api.elections.kalshi.com": 0.4}  # Kalshi's public limit is shared with Signal Lab
 _next_slot: dict[str, float] = {}
 
 

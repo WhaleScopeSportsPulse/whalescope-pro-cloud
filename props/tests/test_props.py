@@ -169,6 +169,31 @@ class Underdog(unittest.TestCase):
             props, ok, _ = service.collect_sources()
         self.assertEqual([p.player for p in props], ["B", "C"])
 
+    def test_kalshi_rate_limit_is_waited_out(self):
+        err = kalshi.net.urllib.error.HTTPError("u", 429, "Too Many Requests", None, None)
+        page = {"markets": [{"ticker": "A"}], "cursor": ""}
+        with mock.patch.object(kalshi.net, "get_json", side_effect=[err, err, page]) as gj, \
+                mock.patch.object(kalshi.time, "sleep") as sleep:
+            self.assertEqual(kalshi.markets("KXNBAPTS"), [{"ticker": "A"}])
+        self.assertEqual(gj.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [15, 30])
+        with mock.patch.object(kalshi.net, "get_json", side_effect=err), mock.patch.object(kalshi.time, "sleep"):
+            with self.assertRaises(Exception):
+                kalshi.markets("KXNBAPTS")
+        other = kalshi.net.urllib.error.HTTPError("u", 404, "Not Found", None, None)
+        with mock.patch.object(kalshi.net, "get_json", side_effect=other), mock.patch.object(kalshi.time, "sleep") as s2:
+            with self.assertRaises(Exception):
+                kalshi.markets("KXNBAPTS")
+        s2.assert_not_called()
+
+    def test_drop_started_for_failed_source(self):
+        from props import db
+        with mock.patch.object(db, "query", return_value=[{}, {}]) as q:
+            self.assertEqual(db.drop_started({"kalshi": "429"}), 2)
+        sql, params = q.call_args.args[:2]
+        self.assertIn("start_time <= now()", sql)
+        self.assertEqual(params, ["{kalshi}"])
+
     def test_failed_source_is_skipped(self):
         with mock.patch.object(underdog, "fetch_props", side_effect=OSError("426")), \
                 mock.patch.object(kalshi, "fetch_props", return_value=[]):

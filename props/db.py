@@ -97,6 +97,12 @@ def query(sql: str, params: list | None = None, url: str | None = None) -> list[
     return _post({"query": sql, "params": params or []}, url or os.environ["DATABASE_URL"])["rows"]
 
 
+def drop_started(sources: Iterable[str], url: str | None = None) -> int:
+    """Remove started games from sources that failed this refresh, so their kept rows don't go stale."""
+    return len(query("DELETE FROM props.props_board WHERE source = ANY($1::text[]) AND start_time <= now() "
+                     "RETURNING 1", [_arr(sources)], url))
+
+
 def save(rows: list[dict], sources: Iterable[str], leagues: Optional[Iterable[str]] = None,
          url: str | None = None) -> int:
     """Replace the board rows for `sources` (and `leagues`, default all) with `rows` in one transaction."""

@@ -155,6 +155,7 @@ def main(argv=None) -> int:
         if not os.environ.get("DATABASE_URL"):
             print("DATABASE_URL is not set", file=sys.stderr)
             return 2
+        errors = {}
         if a.from_json:
             rows, ok = json.load(open(a.from_json)), service.SOURCES
         else:
@@ -166,6 +167,9 @@ def main(argv=None) -> int:
             rows = service.enrich(props)
         n = db.save(rows, ok, a.league)
         print(f"saved {n} props to props.props_board ({', '.join(ok)})")
+        if not a.from_json and errors:
+            # The failed source keeps last refresh's rows; drop the ones whose game has started.
+            print(f"kept previous {', '.join(errors)} rows; dropped {db.drop_started(errors)} started", file=sys.stderr)
         if not a.from_json:
             from . import picks
             try:

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import re
+import time
 from typing import Iterable, Optional
 
 from . import espn, net
@@ -11,6 +13,11 @@ from .props import Prop
 
 BASE = os.environ.get("KALSHI_BASE", "https://api.elections.kalshi.com/trade-api/v2/")
 MARKET_TTL = float(os.environ.get("PROPS_KALSHI_TTL", 60))
+# Signal Lab polls Kalshi from the same Render region, so a refresh can hit HTTP 429
+# even at our own slow pace. Wait it out (the cron has 15 minutes) instead of
+# dropping every Kalshi line for the refresh.
+RATE_LIMIT_WAITS = (15, 30, 45, 60)
+log = logging.getLogger("props")
 
 # Kalshi series ticker -> (league, stat key). Every series here is a
 # per-game player threshold ("Player: N+") market.
@@ -88,11 +95,22 @@ def parse_market(m: dict, league: str, stat_key: str, table: dict) -> Optional[P
     )
 
 
+def _page(series: str, cursor: Optional[str]) -> dict:
+    for wait in (*RATE_LIMIT_WAITS, None):
+        try:
+            return net.get_json(f"{BASE}markets", {"series_ticker": series, "status": "open", "limit": 1000,
+                                                   "cursor": cursor}, ttl=MARKET_TTL)
+        except Exception as e:
+            if getattr(e, "code", None) != 429 or wait is None:
+                raise
+            log.warning("Kalshi rate limit on %s; retrying in %ss", series, wait)
+            time.sleep(wait)
+
+
 def markets(series: str) -> list[dict]:
     out, cursor = [], None
     while True:
-        data = net.get_json(f"{BASE}markets", {"series_ticker": series, "status": "open", "limit": 1000,
-                                               "cursor": cursor}, ttl=MARKET_TTL)
+        data = _page(series, cursor)
         out += data.get("markets") or []
         cursor = data.get("cursor")
         if not cursor or not data.get("markets"):
