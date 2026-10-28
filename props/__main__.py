@@ -152,6 +152,7 @@ def main(argv=None) -> int:
             print_report(rep)
     elif a.cmd == "load":
         from . import db
+        espn.CACHE_GAMELOGS = False  # one-shot run: keep peak memory under the cron's 512 MB
         if not os.environ.get("DATABASE_URL"):
             print("DATABASE_URL is not set", file=sys.stderr)
             return 2

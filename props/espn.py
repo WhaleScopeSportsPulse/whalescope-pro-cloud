@@ -20,6 +20,9 @@ WEB = os.environ.get("ESPN_WEB_BASE", "https://site.web.api.espn.com/apis/common
 CURRENT_TTL = float(os.environ.get("PROPS_GAMELOG_TTL", 1800))
 PAST_TTL = 24 * 3600
 ROSTER_TTL = 6 * 3600
+# The web server keeps parsed game logs between refreshes. A one-shot `load` reads each
+# log once, and caching ~3,700 of them pushed the 512 MB cron over its memory limit.
+CACHE_GAMELOGS = True
 ET = dt.timezone(dt.timedelta(hours=-5))  # ESPN scoreboard dates are US dates
 
 # Exchange/app abbreviations that differ from ESPN's and can't be found by prefix.
@@ -52,15 +55,19 @@ def normalize_name(name: str) -> str:
     return " ".join(parts)
 
 
+# teams, rosters and injuries cache only the fields we use: ESPN's raw responses are large
+# (a college roster is ~240 KB of JSON) and kept whole they pushed the cron past 512 MB.
 def teams(league: str) -> dict[str, dict]:
     """ESPN abbreviation -> {"id", "abbr", "name"}."""
-    data = net.get_json(f"{SITE}{LEAGUES[league]}/teams", {"limit": 1000}, ttl=ROSTER_TTL)  # cfb: 700+ teams
-    out = {}
-    for t in data["sports"][0]["leagues"][0]["teams"]:
-        t = t["team"]
-        out[t["abbreviation"].upper()] = {"id": str(t["id"]), "abbr": t["abbreviation"].upper(),
-                                          "name": t.get("displayName", "")}
-    return out
+    def fetch() -> dict[str, dict]:
+        data = net.get_json(f"{SITE}{LEAGUES[league]}/teams", {"limit": 1000})  # cfb: 700+ teams
+        out = {}
+        for t in data["sports"][0]["leagues"][0]["teams"]:
+            t = t["team"]
+            out[t["abbreviation"].upper()] = {"id": str(t["id"]), "abbr": t["abbreviation"].upper(),
+                                              "name": t.get("displayName", "")}
+        return out
+    return net.memo(f"teams:{league}", ROSTER_TTL, fetch)
 
 
 def match_team(league: str, abbr: str, table: Optional[dict] = None) -> Optional[dict]:
@@ -82,13 +89,15 @@ def current_season(league: str) -> int:
 
 
 def roster(league: str, team_id: str) -> list[dict]:
-    data = net.get_json(f"{SITE}{LEAGUES[league]}/teams/{team_id}/roster", ttl=ROSTER_TTL)
-    out = []
-    for a in data.get("athletes", []):
-        for p in a.get("items", [a]):
-            if "id" in p:
-                out.append({"id": str(p["id"]), "name": p.get("fullName") or p.get("displayName", "")})
-    return out
+    def fetch() -> list[dict]:
+        data = net.get_json(f"{SITE}{LEAGUES[league]}/teams/{team_id}/roster")
+        out = []
+        for a in data.get("athletes", []):
+            for p in a.get("items", [a]):
+                if "id" in p:
+                    out.append({"id": str(p["id"]), "name": p.get("fullName") or p.get("displayName", "")})
+        return out
+    return net.memo(f"roster:{league}:{team_id}", ROSTER_TTL, fetch)
 
 
 def pick_player(name: str, candidates: list[dict]) -> Optional[dict]:
@@ -124,6 +133,8 @@ def gamelog(league: str, athlete_id: str, season: int, category: Optional[str], 
                 return []
             raise
         return parse_gamelog(data, season)
+    if not CACHE_GAMELOGS:
+        return fetch()
     # Cache parsed games, not ESPN's much larger raw JSON.
     return net.memo(f"gamelog:{url}:{season}:{category}", CURRENT_TTL if is_current else PAST_TTL, fetch)
 
@@ -262,16 +273,19 @@ def _designation(status: str, comment: str) -> Optional[str]:
 
 def injuries(league: str) -> dict[str, str]:
     """ESPN athlete id -> injury designation for every listed player in the league."""
-    data = net.get_json(f"{SITE}{LEAGUES[league]}/injuries", ttl=INJURY_TTL)
-    out = {}
-    for team in data.get("injuries") or []:
-        for i in team.get("injuries") or []:
-            links = (i.get("athlete") or {}).get("links") or []
-            m = next((re.search(r"/id/(\d+)", l.get("href", "")) for l in links if "/id/" in l.get("href", "")), None)
-            tag = _designation(i.get("status"), i.get("shortComment"))
-            if m and tag:
-                out[m.group(1)] = tag
-    return out
+    def fetch() -> dict[str, str]:
+        data = net.get_json(f"{SITE}{LEAGUES[league]}/injuries")
+        out = {}
+        for team in data.get("injuries") or []:
+            for i in team.get("injuries") or []:
+                links = (i.get("athlete") or {}).get("links") or []
+                m = next((re.search(r"/id/(\d+)", l.get("href", "")) for l in links if "/id/" in l.get("href", "")),
+                         None)
+                tag = _designation(i.get("status"), i.get("shortComment"))
+                if m and tag:
+                    out[m.group(1)] = tag
+        return out
+    return net.memo(f"injuries:{league}", INJURY_TTL, fetch)
 
 
 CORE = os.environ.get("ESPN_CORE_BASE", "https://sports.core.api.espn.com/v2/sports/")

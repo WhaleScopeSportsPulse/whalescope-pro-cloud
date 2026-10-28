@@ -18,6 +18,7 @@ log = logging.getLogger("props")
 WORKERS = int(os.environ.get("PROPS_WORKERS", 6))
 SEASONS_BACK = int(os.environ.get("PROPS_H2H_SEASONS_BACK", 2))
 WINDOW_KEYS = ("l5", "l10", "l20", "season", "h2h")
+MAX_ROSTER_SCAN = 40
 AVAILABILITY_KEYS = ("injury_status", "starter", "min_l5", "min_season", "min_trend")
 MODEL_KEYS = ("p_model", "edge", "edge_side", "model_version")
 LINEUP_WINDOW = dt.timedelta(minutes=90)  # look for posted NBA starters this close to tip-off
@@ -26,7 +27,8 @@ LINEUP_WINDOW = dt.timedelta(minutes=90)  # look for posted NBA starters this cl
 def _resolve_player(p: Prop) -> Optional[dict]:
     ids = [i for i in (p.team_id, p.opponent_id) if i]
     found = espn.find_player(p.league, p.player, ids) if ids else None
-    if not found and not p.team_id:
+    # Searching every roster is fine for pro leagues (~30 teams) but not college football (700+).
+    if not found and not p.team_id and len(espn.teams(p.league)) <= MAX_ROSTER_SCAN:
         found = espn.find_player(p.league, p.player, [t["id"] for t in espn.teams(p.league).values()])
     return found
 
