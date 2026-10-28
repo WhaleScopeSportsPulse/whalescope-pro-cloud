@@ -1,6 +1,7 @@
 import os,time,json,threading,datetime,urllib.request,urllib.parse,math
 import signal_lab_exit
 import signal_lab_depth
+import signal_lab_model as slm
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 BASE="https://external-api.kalshi.com/trade-api/v2/"
@@ -83,7 +84,79 @@ def setup():
  # Independent "bet the current leader" baseline: own price, strike, ask and grade.
  for col in ("close_ts BIGINT","btc DOUBLE PRECISION","target DOUBLE PRECISION","leader_ask INTEGER","method TEXT","result TEXT","graded_at BIGINT"):
   q.execute("ALTER TABLE signal_lab_baseline_v1 ADD COLUMN IF NOT EXISTS "+col)
+ # v2 decision snapshot at 9:00 left, with paper trades (no real orders are ever placed).
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_decisions_v2("+",".join(n+" "+t for n,t in DECISION_COLS)+")")
+ # 5-second readings older than RETENTION_DAYS are rolled up into 1-minute rows.
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_observations_1m(ticker TEXT NOT NULL, minute_ts BIGINT NOT NULL, n INTEGER NOT NULL, btc_open DOUBLE PRECISION, btc_high DOUBLE PRECISION, btc_low DOUBLE PRECISION, btc_close DOUBLE PRECISION, reference DOUBLE PRECISION, up_ask_avg DOUBLE PRECISION, down_ask_avg DOUBLE PRECISION, up_bid_avg DOUBLE PRECISION, down_bid_avg DOUBLE PRECISION, PRIMARY KEY(ticker,minute_ts))")
  c.commit();c.close()
+DECISION_COLS=(("ticker","TEXT PRIMARY KEY"),("source","TEXT NOT NULL DEFAULT 'live'"),("decided_at","BIGINT NOT NULL"),("close_ts","BIGINT NOT NULL"),("seconds_left","INTEGER"),("btc","DOUBLE PRECISION"),("reference","DOUBLE PRECISION"),("reference_estimated","BOOLEAN"),("distance","DOUBLE PRECISION"),("up_ask","DOUBLE PRECISION"),("down_ask","DOUBLE PRECISION"),("up_bid","DOUBLE PRECISION"),("down_bid","DOUBLE PRECISION"),("spread","DOUBLE PRECISION"),("up_ask_size","DOUBLE PRECISION"),("up_bid_size","DOUBLE PRECISION"),("volume","DOUBLE PRECISION"),("realized_vol","DOUBLE PRECISION"),("mom_60","DOUBLE PRECISION"),("mom_180","DOUBLE PRECISION"),("p_market","DOUBLE PRECISION"),("p_fair","DOUBLE PRECISION"),("p_lr","DOUBLE PRECISION"),("lr_train_rows","INTEGER"),("rule_side","TEXT"),("rule_price","DOUBLE PRECISION"),("model_side","TEXT"),("model_price","DOUBLE PRECISION"),("model_edge","DOUBLE PRECISION"),("result","TEXT"),("graded_at","BIGINT"),("rule_pnl","DOUBLE PRECISION"),("model_pnl","DOUBLE PRECISION"))
+_STORED=[n for n,_ in DECISION_COLS if n not in ("result","graded_at","rule_pnl","model_pnl")]
+def store_decisions(rows):
+ """Insert decision snapshots (live or backfill); an existing round is never overwritten."""
+ if not rows:return 0
+ c=connect();q=c.cursor()
+ sql="INSERT INTO signal_lab_decisions_v2("+",".join(_STORED+["result"])+") VALUES ("+",".join(["%s"]*(len(_STORED)+1))+") ON CONFLICT(ticker) DO NOTHING"
+ q.executemany(sql,[tuple(r.get(n) for n in _STORED)+(r.get("result"),) for r in rows])
+ c.commit();c.close()
+ return len(rows)
+LR={"model":None,"rows":0,"day":None,"tried":0}
+def train_live_model(now):
+ """Refit the logistic model once a day on rounds that closed before today (UTC)."""
+ day=datetime.datetime.fromtimestamp(now,datetime.timezone.utc).date()
+ if LR["day"]==day or now-LR["tried"]<3600:return
+ LR["tried"]=now
+ try:
+  start=int(datetime.datetime.combine(day,datetime.time(),datetime.timezone.utc).timestamp())
+  c=connect();q=c.cursor()
+  cols=["close_ts","btc","reference","distance","seconds_left","realized_vol","up_bid","up_ask","mom_60","mom_180","volume","result"]
+  q.execute("SELECT "+",".join(cols)+" FROM signal_lab_decisions_v2 WHERE result IN ('yes','no') AND close_ts<%s AND NOT coalesce(reference_estimated,false)",(start,))
+  data=[dict(zip(cols,r)) for r in q.fetchall()];c.close()
+  xs,ys,days=[],[],set()
+  for r in data:
+   x=slm.features(r)
+   if x:xs.append(x);ys.append(int(r["result"]=="yes"));days.add(r["close_ts"]//86400)
+  if len(days)>=3 and len(xs)>=200:
+   LR.update(model=slm.Logistic().fit(xs,ys),rows=len(xs),day=day)
+   print("LR TRAINED",len(xs),"rows",len(days),"days",flush=True)
+  else:print("LR NOT TRAINED: need 3 days and 200 rounds, have",len(days),len(xs),flush=True)
+ except Exception as ex:print("LR TRAIN",repr(ex),flush=True)
+def decision_snapshot(ticker,close,now,left,spot,target,m,history,estimated):
+ """The 9:00-left snapshot, its fair value / model probabilities and paper trades."""
+ def num(k):
+  try:return float(m.get(k)) if m.get(k) not in (None,"") else None
+  except (TypeError,ValueError):return None
+ pts=[(t,p) for t,p in history]
+ vol=slm.realized_vol(pts,now)
+ r={"ticker":ticker,"source":"live","decided_at":now,"close_ts":close,"seconds_left":left,"btc":spot,"reference":target,"reference_estimated":bool(estimated),"distance":spot-target,
+    "up_ask":num("yes_ask_dollars"),"down_ask":num("no_ask_dollars"),"up_bid":num("yes_bid_dollars"),"down_bid":num("no_bid_dollars"),
+    "up_ask_size":num("yes_ask_size_fp"),"up_bid_size":num("yes_bid_size_fp"),"volume":num("volume_fp"),
+    "realized_vol":vol,"mom_60":slm.momentum(pts,now,60),"mom_180":slm.momentum(pts,now,180)}
+ r["spread"]=round(r["up_ask"]-r["up_bid"],4) if r["up_ask"] is not None and r["up_bid"] is not None else None
+ r["p_market"]=slm.market_prob(r["up_bid"],r["up_ask"])
+ r["p_fair"]=slm.fair_value(r["distance"],spot,vol,left)
+ x=slm.features(r)
+ r["p_lr"]=round(LR["model"].predict(x),4) if LR["model"] and x else None
+ r["lr_train_rows"]=LR["rows"] if r["p_lr"] is not None else None
+ if not estimated:  # never paper-trade against an estimated (non-Kalshi) reference
+  t=slm.rule_trade(spot,target,r["up_ask"],r["down_ask"])
+  if t:r["rule_side"],r["rule_price"]=t
+  sig=slm.signal(r["p_lr"],r["up_ask"],r["down_ask"])
+  if sig:r["model_side"],r["model_price"],r["model_edge"]=sig
+ return r
+RETENTION_DAYS=int(os.getenv("SIGNAL_LAB_RETENTION_DAYS","30"))
+def retain(now):
+ """Roll 5-second readings older than RETENTION_DAYS into 1-minute rows, then delete them (one transaction)."""
+ cutoff=(now-RETENTION_DAYS*86400)//60*60
+ c=connect();q=c.cursor()
+ try:
+  q.execute("INSERT INTO signal_lab_observations_1m(ticker,minute_ts,n,btc_open,btc_high,btc_low,btc_close,reference,up_ask_avg,down_ask_avg,up_bid_avg,down_bid_avg) SELECT ticker,(ts/60)*60,count(*),(array_agg(btc ORDER BY ts))[1],max(btc),min(btc),(array_agg(btc ORDER BY ts DESC))[1],max(reference),avg(up_ask),avg(down_ask),avg(up_bid),avg(down_bid) FROM signal_lab_observations WHERE ts<%s GROUP BY 1,2 ON CONFLICT(ticker,minute_ts) DO NOTHING",(cutoff,))
+  rolled=q.rowcount
+  q.execute("DELETE FROM signal_lab_observations WHERE ts<%s",(cutoff,))
+  deleted=q.rowcount
+  c.commit()
+  if deleted:print("RETENTION rolled",deleted,"readings into",rolled,"minutes",flush=True)
+  return rolled,deleted
+ finally:c.close()
 def track_features(ticker,forecast,distance,momentum,trend,pattern):
  try:
   c=connect();q=c.cursor()
@@ -165,20 +238,40 @@ def track(ticker,close,direction,strength,now,price,yes_ask,no_ask):
   q.execute("INSERT INTO signal_lab_eval_v1(ticker,close_ts,direction,strength,locked_at,reference_price,market_yes_ask,market_no_ask) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,close,direction,strength,now,price,yes_ask,no_ask))
   c.commit();c.close()
  except Exception as e:print("TRACK",repr(e),flush=True)
+# The props cron (every 15 min) reads Kalshi in roughly the first 3 minutes of each
+# quarter hour; grading waits so the two don't spend the shared rate limit together.
+PROPS_WINDOW=int(os.getenv("SIGNAL_LAB_PROPS_WINDOW","200"))
+GRADE_GAP=0.4
+last_retention=[0]
+def grade_decision(q,ticker,result,now):
+ q.execute("SELECT rule_side,rule_price,model_side,model_price FROM signal_lab_decisions_v2 WHERE ticker=%s AND result IS NULL",(ticker,))
+ row=q.fetchone()
+ if not row:return
+ rs,rp,ms,mp=row
+ won=lambda side:(side=="UP")==(result=="yes")
+ q.execute("UPDATE signal_lab_decisions_v2 SET result=%s,graded_at=%s,rule_pnl=%s,model_pnl=%s WHERE ticker=%s AND result IS NULL",
+           (result,now,round(slm.pnl(won(rs),rp),4) if rs else None,round(slm.pnl(won(ms),mp),4) if ms else None,ticker))
 def verify():
  try:
   c=connect();q=c.cursor();now=int(time.time())
-  q.execute("SELECT ticker FROM (SELECT ticker,close_ts FROM signal_lab_eval_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_baseline_v1 WHERE result IS NULL AND close_ts<%s) p GROUP BY ticker ORDER BY min(close_ts) LIMIT 15",(now-30,now-30))
-  pending=[x[0] for x in q.fetchall()]
+  pending=[]
+  if now%900>=PROPS_WINDOW:
+   q.execute("SELECT ticker FROM (SELECT ticker,close_ts FROM signal_lab_eval_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_baseline_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_decisions_v2 WHERE result IS NULL AND close_ts<%s) p GROUP BY ticker ORDER BY min(close_ts) LIMIT 15",(now-30,now-30,now-30))
+   pending=[x[0] for x in q.fetchall()]
   for ticker in pending:
    try:
+    # One market read grades every table for the round.
     m=fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{})
+    time.sleep(GRADE_GAP)
     result=str(m.get("result") or "").lower()
     if result not in ("yes","no"):continue
     q.execute("UPDATE signal_lab_eval_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL",(result,now,ticker))
     q.execute("UPDATE signal_lab_baseline_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL AND close_ts IS NOT NULL",(result,now,ticker))
+    grade_decision(q,ticker,result,now)
     c.commit()
-   except Exception as e:print("GRADE",ticker,repr(e),flush=True)
+   except Exception as e:
+    print("GRADE",ticker,repr(e),flush=True)
+    if "429" in str(e):break
   q.execute("SELECT direction,result FROM signal_lab_eval_v1 WHERE locked_at >= %s",(1792430840,))
   rows=q.fetchall()
   graded=[(d,r) for d,r in rows if r in ("yes","no") and d in ("UP","DOWN")]
@@ -193,9 +286,22 @@ def verify():
   perf={"graded":len(graded),"wins":wins,"losses":len(graded)-wins,"skips":skips,"pending":sum(r is None for d,r in rows),"accuracy":round(100*wins/len(graded),1) if graded else None,"last":recent,"mistake_audit":{"sample":len(audit),"mistakes":len(mistakes),"recent_reasons":mistakes[:5]}}
   perf["model_audit"]=model_audit()
   perf["leader_comparison"]=baseline_report()
+  perf["decisions_v2"]=decisions_report(q)
   with L:S["performance"]=perf
   c.close()
  except Exception as e:print("VERIFY",repr(e),flush=True)
+ train_live_model(int(time.time()))
+ if time.time()-last_retention[0]>=3600:
+  last_retention[0]=time.time()
+  try:retain(int(time.time()))
+  except Exception as e:print("RETENTION",repr(e),flush=True)
+def decisions_report(q):
+ """Paper results of the live 9:00 snapshot (source='live' only; backfill rows are training data)."""
+ q.execute("SELECT count(*),count(result),count(rule_side),count(rule_pnl),coalesce(sum(rule_pnl),0),count(model_side),count(model_pnl),coalesce(sum(model_pnl),0),avg(power(p_market-(result='yes')::int,2)),avg(power(p_fair-(result='yes')::int,2)),avg(power(p_lr-(result='yes')::int,2)) FROM signal_lab_decisions_v2 WHERE source='live'")
+ n,graded,rule,rule_graded,rule_pnl,model,model_graded,model_pnl,b_mkt,b_fair,b_lr=q.fetchone()
+ r=lambda v:round(float(v),4) if v is not None else None
+ return {"snapshots":n,"graded":graded,"paper_only":True,"leader_50_59_rule":{"trades":rule,"graded":rule_graded,"pnl":r(rule_pnl)},
+         "model_signal":{"trades":model,"graded":model_graded,"pnl":r(model_pnl)},"brier":{"market":r(b_mkt),"fair_value":r(b_fair),"logistic":r(b_lr)}}
 def saved(ticker):
  try:
   c=connect();q=c.cursor();q.execute("SELECT locked,strength,locked_at FROM signal_lab_github_locks WHERE ticker=%s",(ticker,));v=q.fetchone();c.close();return v
@@ -264,6 +370,8 @@ def cycle():
  last_verify=0
  market=None
  baseline_ticker=None
+ decided_ticker=None
+ snap_at=None
  last_ticker=None
  record_cache=None
  historical=None
@@ -416,6 +524,19 @@ def cycle():
    if db_ready and left<=780 and baseline_ticker!=ticker:
     leader_ask=cents(m.get("yes_ask_dollars") if spot>=target else m.get("no_ask_dollars"))
     if record_baseline(ticker,close,spot,target,leader_ask,now):baseline_ticker=ticker
+   # v2 decision snapshot at exactly 9:00 left (the loop wakes on that second).
+   snap_at=close-slm.DECISION_LEFT if decided_ticker!=ticker else None
+   if decided_ticker!=ticker and slm.DECISION_LEFT-15<=left<=slm.DECISION_LEFT:
+    decided_ticker=ticker
+    if not fresh:
+     try:
+      m={**m,**{k:v for k,v in fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{}).items() if v is not None}}
+     except Exception as ex:print("DECISION QUOTE",repr(ex),flush=True)
+    d=decision_snapshot(ticker,close,now,left,spot,target,m,history,m.get("estimated_reference"))
+    with L:S["decision_v2"]={k:d.get(k) for k in ("ticker","seconds_left","p_market","p_fair","p_lr","rule_side","rule_price","model_side","model_price","model_edge")}
+    if db_ready:
+     try:store_decisions([d])
+     except Exception as ex:print("DECISION TRACK",repr(ex),flush=True)
    if db_ready and now-last_verify>=60:
     last_verify=now
     verify_async()
@@ -442,8 +563,11 @@ def cycle():
    # A missing round is usually the rollover itself; retry quickly so the round's
    # first seconds are recorded.
    time.sleep(10 if "429" in str(e) else 1 if "currently trading" in str(e) else 14)
-  # One single-market request per tick; sleep only the remainder of the interval.
-  time.sleep(max(0.5,OBSERVE_SECONDS-(time.time()-tick)))
+  # One single-market request per tick; sleep only the remainder of the interval,
+  # or wake exactly at the 9:00-left decision second if it falls inside it.
+  wait=max(0.5,OBSERVE_SECONDS-(time.time()-tick))
+  if snap_at and time.time()<snap_at<=time.time()+wait:wait=snap_at-time.time()+0.05
+  time.sleep(wait)
 HTML='''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090e18"><title>Signal Lab</title><style>
 *{box-sizing:border-box}body{margin:0;background:#090e18;color:#eef5ff;font:16px system-ui,sans-serif}.wrap{max-width:760px;margin:auto;padding:22px 18px 70px}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:26px}.logo{font-size:25px;font-weight:900}.pill{background:#243750;border-radius:99px;padding:9px 12px;font-size:12px}.card{background:linear-gradient(140deg,#152641,#101c30);border:1px solid #2b4261;border-radius:24px;padding:23px;margin:16px 0}.label{font-size:12px;font-weight:800;letter-spacing:2px;color:#a4b7d0}.signal{font-size:clamp(65px,17vw,110px);font-weight:900;letter-spacing:-5px;margin:10px 0}.up{color:#2ee0aa}.down{color:#ff6886}.warn{color:#ffc26b}.muted{color:#9fb3cd}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.price{font-size:clamp(24px,6vw,40px);font-weight:850;letter-spacing:-1px;margin:8px 0}.between{display:flex;align-items:center;justify-content:space-between;gap:8px}.timer{font-size:29px;font-weight:850}.bar{height:9px;border-radius:9px;background:#293d56;overflow:hidden;margin:20px 0}.fill{height:100%;width:0;background:linear-gradient(90deg,#42a7f7,#2edcad)}.diff{font-size:22px;font-weight:800;margin:24px 0}.notice{padding:14px;border:1px solid #91673e;border-radius:13px;background:#403020;margin-top:17px}svg{display:block;width:100%;height:170px}details{background:#121f34;border:1px solid #2b4261;border-radius:16px;padding:20px;margin:14px 0}summary{font-weight:750;cursor:pointer}.small{font-size:13px;line-height:1.7}
 body{background:#0b1020!important;color:#e9eefb!important}.wrap{max-width:1180px!important}.card{background:linear-gradient(145deg,#1b2540,#141c30)!important;border:1px solid #303957!important;box-shadow:0 8px 25px #05081444!important}.logo{color:#b49bff!important}.pill{background:#303253!important;color:#a9efcf!important}.label{color:#b5b1da!important}.fill{background:linear-gradient(90deg,#ad8bff,#6ce8bc)!important}.signal.up,.up{color:#6ce8bc!important}.signal.down,.down{color:#ff7e9f!important}.price{color:#f0edff!important}svg{background:linear-gradient(180deg,#23254655,#151c3000);border-radius:12px}details{background:#161e33!important;border-color:#343857!important}@media(min-width:900px){.wrap{padding-top:32px!important}.head{margin-bottom:36px!important}.card{padding:30px!important}}.wrap{max-width:1200px;display:grid;grid-template-columns:2fr 1fr;gap:16px}.head{grid-column:1/-1}.wrap>.card{margin:0}.wrap>.card:nth-of-type(1){grid-column:2;grid-row:2}.wrap>.card:nth-of-type(2){grid-column:1;grid-row:2}.wrap>.card:nth-of-type(3){grid-column:1/-1}.wrap>details{grid-column:1/-1}@media(max-width:700px){.wrap{display:flex;flex-direction:column}}.wrap{grid-template-columns:210px minmax(0,2fr) minmax(0,1fr)!important;gap:16px!important}.sidebar{grid-column:1;grid-row:1/5;background:#121a2e;border:1px solid #303957;border-radius:20px;padding:24px 15px;display:flex;flex-direction:column;gap:12px}.sidebrand{color:#b49bff;font-size:19px;font-weight:900;padding:8px 10px 26px}.sideitem{font-size:14px;color:#a8b3d2;padding:14px;border-radius:12px}.sideitem.active{background:#302957;color:#d9cbff;font-weight:800}.sidefoot{margin-top:auto;color:#7686a8;font-size:11px;line-height:2;padding:12px}.head{grid-column:2/-1!important;grid-row:1!important;margin:0!important;padding:14px 18px;border:1px solid #303957;border-radius:16px;background:#161e33}.wrap>.card:nth-of-type(1){grid-column:3!important;grid-row:2!important}.wrap>.card:nth-of-type(2){grid-column:2!important;grid-row:2!important}.wrap>.card:nth-of-type(3){grid-column:2/-1!important;grid-row:3!important}.wrap>details{grid-column:2/-1!important}.signal{font-size:clamp(35px,4vw,65px)!important;letter-spacing:-2px!important;overflow-wrap:anywhere}.card{border-radius:18px!important}@media(max-width:900px){.wrap{display:flex!important;flex-direction:column!important;gap:12px!important;padding:14px!important}.sidebar{display:flex;flex-direction:row;align-items:center;overflow-x:auto;padding:8px!important;gap:6px;border-radius:13px}.sidebrand{font-size:14px;padding:8px;white-space:nowrap}.sideitem{font-size:12px;padding:10px;white-space:nowrap}.sidefoot{display:none}.head{padding:12px 16px!important}.logo{font-size:18px!important}.card{padding:18px!important}.wrap>.card:nth-of-type(1){order:1}.wrap>.card:nth-of-type(2){order:2}.wrap>.card:nth-of-type(3){order:3}.wrap>details{order:4}.signal{font-size:clamp(36px,10vw,62px)!important;letter-spacing:-2px!important}.price{font-size:clamp(18px,5vw,32px)!important}.label{font-size:10px!important;letter-spacing:1px!important}.diff{font-size:17px!important;margin:14px 0!important}svg{height:210px!important}}.heading{display:flex;flex-direction:column;gap:4px}.eyebrow{font-size:10px;letter-spacing:1.5px;color:#8e9cb9}.subheading{font-size:12px;color:#8999b8}.metrics{grid-column:2/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{min-width:0;background:linear-gradient(125deg,#1d2943,#171e33);border:1px solid #303957;border-radius:17px;padding:18px;display:flex;flex-direction:column;gap:10px}.metric span{font-size:10px;letter-spacing:1px;color:#9aa6c3}.metric strong{font-size:clamp(16px,2vw,26px);white-space:nowrap;letter-spacing:-.8px}.metric small{font-size:11px;color:#7e90b0}.wrap>.card:nth-of-type(1){grid-row:3!important}.wrap>.card:nth-of-type(2){grid-row:3!important}.wrap>.card:nth-of-type(3){grid-row:4!important}.sidebar{grid-row:1/6!important}.wrap>details{grid-column:2/-1!important}@media(max-width:900px){.metrics{order:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.metric{padding:13px;border-radius:12px}.metric strong{font-size:clamp(16px,4.3vw,23px)}.metric span{font-size:9px}.metric small{font-size:10px}.head{order:0}.sidebar{order:0}.wrap>.card:nth-of-type(1){order:1}.wrap>.card:nth-of-type(2){order:2}.wrap>.card:nth-of-type(3){order:3}}body{background:#0a0915!important}.sidebar{background:#100e22!important;border-color:#27213e!important}.sideitem.active{background:#6334b7!important;color:white!important}.sidebrand,.logo{color:#d0aaff!important}.head{background:#110f24!important;border-color:#27213e!important}.card,.metric{background:linear-gradient(135deg,#1c1537,#100f23)!important;border:1px solid #312449!important;box-shadow:0 8px 32px #05030e66!important}.metric:nth-child(2){background:linear-gradient(130deg,#17152f,#111a27)!important}.metric:nth-child(3){background:linear-gradient(130deg,#1e1631,#141020)!important}.metric:nth-child(4){background:linear-gradient(130deg,#20142c,#141020)!important}.metric strong{color:#f1e9ff!important}.fill{background:linear-gradient(90deg,#8d4de5,#d1a0ff)!important}.signal.warn{color:#ffbc69}.pill{background:#30214d!important;color:#dfc8ff!important}.donutrow{display:flex;align-items:center;justify-content:center;gap:24px;margin:22px 0}.donut{--pct:0;width:170px;height:170px;flex:none;border-radius:50%;background:conic-gradient(#a576ff calc(var(--pct)*1%),#ffb660 0);display:grid;place-items:center;box-shadow:0 0 30px #6731ac30}.donutcore{width:118px;height:118px;border-radius:50%;background:#151128;display:grid;place-items:center;color:#fff;font-size:31px;font-weight:850}.donutlegend{display:grid;gap:13px;color:#aab0cb;font-size:12px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}.dot.good{background:#a576ff}.dot.bad{background:#ffb660}.dot.neutral{background:#6c6687}.wrap>.card:nth-of-type(3){grid-column:3!important;grid-row:4!important}.wrap>.card:nth-of-type(2){grid-row:3/5!important}#chart{stroke:#ae82ff!important;stroke-width:3.5!important}svg{height:270px!important;background:linear-gradient(180deg,#6c3cae17,#0c0b1a00)!important}@media(max-width:900px){.donutrow{gap:12px}.donut{width:130px;height:130px}.donutcore{width:90px;height:90px;font-size:25px}.wrap>.card:nth-of-type(2){order:2}.wrap>.card:nth-of-type(3){order:3}svg{height:190px!important}}
@@ -491,5 +615,6 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   if not membership.post(self,self.path.split("?")[0]):self.send_error(404)
  def log_message(self,*args):pass
-threading.Thread(target=cycle,daemon=True).start()
-ThreadingHTTPServer(("0.0.0.0",int(os.getenv("PORT","10000"))),Handler).serve_forever()
+if __name__=="__main__":
+ threading.Thread(target=cycle,daemon=True).start()
+ ThreadingHTTPServer(("0.0.0.0",int(os.getenv("PORT","10000"))),Handler).serve_forever()
