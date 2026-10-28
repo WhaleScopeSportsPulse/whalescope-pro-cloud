@@ -37,9 +37,10 @@ V2_MIN_GAMES = 10
 EXCLUDED = ("Out", "Doubtful")
 WINDOW = dt.timedelta(hours=2)
 FULL = (("l5", 5), ("l10", 10), ("l20", 20))
-# A final game missing from the player's log counts as did-not-play only after
-# this long, so a game log that ESPN hasn't updated yet isn't voided.
-DNP_AFTER = dt.timedelta(hours=6)
+# ESPN can take many hours to add a final game to a player's game log, so a missing
+# log entry alone never voids a pick: the box score must show the player didn't play.
+# Only if ESPN never publishes a box score do we void after this long.
+NO_BOX_AFTER = dt.timedelta(hours=48)
 
 SCHEMA = [
     "CREATE SCHEMA IF NOT EXISTS props",
@@ -229,10 +230,12 @@ def grade(now: Optional[dt.datetime] = None, url: Optional[str] = None, limit: i
                 played, actual = _player_game(p["league"], p["athlete_id"], p["stat"], p["event_id"])
                 if played and actual is not None:
                     result = grade_value(actual, p["line"], p["side"])
-                elif now - start >= DNP_AFTER:
-                    result, actual = "void", None
                 else:
-                    continue
+                    box = espn.box_played(p["league"], p["event_id"], p["athlete_id"])
+                    if box is False or (box is None and now - start >= NO_BOX_AFTER):
+                        result, actual = "void", None
+                    else:  # played (or no box score yet): wait for the game log
+                        continue
         except Exception as e:  # one bad lookup shouldn't stop the rest
             log.warning("grading pick %s failed: %s", p["id"], e)
             continue

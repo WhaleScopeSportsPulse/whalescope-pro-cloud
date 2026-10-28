@@ -265,6 +265,8 @@ class Picks(unittest.TestCase):
                  event(tip, "post", "STATUS_POSTPONED", False, eid="3"), event(tip, "in", eid="4"),
                  event(tip, "post", "STATUS_FINAL", True, eid="5")]
         games = {"1": (True, 30.0), "2": (False, None), "5": (False, None)}
+        # Event 2: box score says the player sat. Event 5: he played but the game log lags.
+        box = {"2": False, "5": True}
         updates = []
 
         def query(sql, params=None, url=None):
@@ -275,14 +277,28 @@ class Picks(unittest.TestCase):
 
         with mock.patch.object(picks.db, "query", side_effect=query), \
                 mock.patch.object(espn, "scoreboard", return_value=board), \
+                mock.patch.object(espn, "box_played", side_effect=lambda l, e, a: box[e]), \
                 mock.patch.object(picks, "_player_game", side_effect=lambda l, a, s, e: games[e]):
-            counts = picks.grade(tip + dt.timedelta(hours=7))
-            self.assertEqual(counts, {"hit": 1, "void": 3})
+            counts = picks.grade(tip + dt.timedelta(hours=30))
+            self.assertEqual(counts, {"hit": 1, "void": 2})
             self.assertEqual(sorted((u[2], u[0], u[1]) for u in updates),
-                             [(1, "hit", 30.0), (2, "void", None), (3, "void", None), (5, "void", None)])
+                             [(1, "hit", 30.0), (2, "void", None), (3, "void", None)])
+            # No box score at all: wait, then void only after NO_BOX_AFTER.
+            box["5"] = None
             updates.clear()
-            # Final but missing from the log only 3h after tip: wait for ESPN to update.
-            self.assertEqual(picks.grade(tip + dt.timedelta(hours=3)), {"hit": 1, "void": 1})
+            self.assertNotIn(5, [u[2] for u in (picks.grade(tip + dt.timedelta(hours=30)) and updates)])
+            updates.clear()
+            picks.grade(tip + dt.timedelta(hours=49))
+            self.assertIn((5, "void"), [(u[2], u[0]) for u in updates])
+
+    def test_box_played(self):
+        summary = {"boxscore": {"players": [{"statistics": [{"athletes": [
+            {"athlete": {"id": "1"}, "stats": ["20", "3"]},
+            {"athlete": {"id": "2"}, "didNotPlay": True, "stats": []}]}]}]}}
+        with mock.patch.object(espn.net, "get_json", return_value=summary):
+            self.assertEqual([espn.box_played("nba", "9", a) for a in ("1", "2", "3")], [True, False, False])
+        with mock.patch.object(espn.net, "get_json", return_value={"boxscore": {}}):
+            self.assertIsNone(espn.box_played("nba", "9", "1"))
 
     def test_no_gamelog_this_season_is_not_played(self):
         err = picks.net.urllib.error.HTTPError("u", 404, "Not Found", None, None)

@@ -298,3 +298,18 @@ def minutes(league: str, g: Game) -> Optional[float]:
         return float(v)
     except ValueError:
         return None
+
+
+def box_played(league: str, event_id: str, athlete_id: str) -> Optional[bool]:
+    """Whether the final box score shows the player in the game: True, False (absent or DNP),
+    or None when ESPN has no box score with players yet."""
+    data = net.get_json(f"{SITE}{LEAGUES[league]}/summary", {"event": event_id})
+    teams = (data.get("boxscore") or {}).get("players") or []
+    seen = False
+    for team in teams:
+        for group in team.get("statistics") or []:
+            for a in group.get("athletes") or []:
+                seen = True
+                if str((a.get("athlete") or {}).get("id")) == str(athlete_id):
+                    return not a.get("didNotPlay") and bool(a.get("stats"))
+    return False if seen else None
