@@ -133,5 +133,45 @@ class Snapshot(unittest.TestCase):
         self.assertNotIn("rule_side", est)                      # no paper trades on an estimated reference
 
 
+class Reference(unittest.TestCase):
+    OPEN = 1_800_000_000
+
+    def test_own_reference_averages_the_minute_before_open(self):
+        samples = [(self.OPEN - 65, 1.0)] + [(self.OPEN - 60 + 5 * i, 80000.0 + i) for i in range(12)] + [(self.OPEN, 9.0)]
+        self.assertAlmostEqual(signal_lab.own_reference(samples, self.OPEN), 80005.5)
+
+    def test_own_reference_needs_samples_across_the_window(self):
+        self.assertIsNone(signal_lab.own_reference([(self.OPEN - 20 + i, 80000.0) for i in range(20)], self.OPEN))
+        self.assertIsNone(signal_lab.own_reference([(self.OPEN - 60 + 10 * i, 80000.0) for i in range(5)], self.OPEN))
+        self.assertIsNone(signal_lab.own_reference([(self.OPEN - 60 + 5 * i, 0.0) for i in range(12)], self.OPEN))
+
+    def test_kalshi_strike_ignores_zero_and_missing(self):
+        self.assertEqual(signal_lab.kalshi_strike({"floor_strike": 77679.24}), 77679.24)
+        self.assertIsNone(signal_lab.kalshi_strike({"floor_strike": 0}))
+        self.assertIsNone(signal_lab.kalshi_strike({"floor_strike": "0.0"}))
+        self.assertIsNone(signal_lab.kalshi_strike({}))
+
+    def test_kalshi_strike_wins_when_present(self):
+        self.assertEqual(signal_lab.choose_reference(80000.0, 80050.0, None, 80010.0, True), (80000.0, "kalshi", None))
+
+    def test_kalshi_strike_far_from_price_is_skipped(self):
+        ref, src, why = signal_lab.choose_reference(70000.0, None, None, 80000.0, True)
+        self.assertIsNone(ref)
+        self.assertIn("from price", why)
+
+    def test_fallback_is_provisional_before_the_lock(self):
+        self.assertEqual(signal_lab.choose_reference(None, 80000.0, 79900.0, 80010.0, False), (80000.0, "own", None))
+
+    def test_fallback_checked_against_last_floor_strike_at_the_lock(self):
+        self.assertEqual(signal_lab.choose_reference(None, 80003.0, 80000.0, 80010.0, True), (80003.0, "own", None))
+        ref, _, why = signal_lab.choose_reference(None, 80030.0, 80000.0, 80010.0, True)
+        self.assertIsNone(ref)
+        self.assertIn("last floor_strike", why)
+        self.assertIsNone(signal_lab.choose_reference(None, 80030.0, None, 80010.0, True)[0])
+
+    def test_no_reference_at_all(self):
+        self.assertIsNone(signal_lab.choose_reference(None, None, 80000.0, 80010.0, False)[0])
+
+
 if __name__ == "__main__":
     unittest.main()
