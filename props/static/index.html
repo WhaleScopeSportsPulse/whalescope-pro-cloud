@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WhaleScope Props</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* Layout: sticky filter bar over one dense, horizontally scrollable prop board. */
+:root {
+  --bg: #f3f5f7; --panel: #ffffff; --fg: #15202b; --muted: #5d6b79; --line: #d9e0e6;
+  --accent: #0a6cff; --hit: #0f8a5f; --hit-bg: #dff3ea; --mid: #8a6a00; --mid-bg: #fbf1cf;
+  --miss: #b4323b; --miss-bg: #f8e1e3;
+  --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --body: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0d1419; --panel: #141e26; --fg: #e5edf3; --muted: #8fa1b0; --line: #24323d;
+  --accent: #5aa2ff; --hit: #4fd1a0; --hit-bg: #11352a; --mid: #e2c25a; --mid-bg: #352d10;
+  --miss: #f07f88; --miss-bg: #3a171b; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0d1419; --panel: #141e26; --fg: #e5edf3; --muted: #8fa1b0; --line: #24323d;
+  --accent: #5aa2ff; --hit: #4fd1a0; --hit-bg: #11352a; --mid: #e2c25a; --mid-bg: #352d10;
+  --miss: #f07f88; --miss-bg: #3a171b; color-scheme: dark }
+* { box-sizing: border-box }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 0 32px }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; padding-block: 20px 8px }
+h1 { font: 700 30px/1 var(--display); letter-spacing: .02em; margin: 0; text-transform: uppercase }
+#meta { color: var(--muted); font-size: 13px }
+.bar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg);
+  display: flex; flex-wrap: wrap; gap: 8px 12px; padding-block: 10px; border-bottom: 1px solid var(--line) }
+.bar label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted) }
+select, input { font: 14px var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; min-width: 0 }
+input#player { width: 12rem; max-width: 100% }
+select:focus-visible, input:focus-visible, button:focus-visible, th:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px }
+.wrap { overflow-x: auto; margin-top: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px }
+table { border-collapse: collapse; width: 100%; min-width: 980px; font-variant-numeric: tabular-nums }
+th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap }
+th { font: 600 12px var(--display); font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+  cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel) }
+th[aria-sort] { color: var(--fg) }
+td.num, th.num { text-align: right }
+.player { font-weight: 600 }
+.sub { color: var(--muted); font-size: 12px }
+.src { font: 500 11px var(--mono); text-transform: uppercase; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--line) }
+.line { font: 500 14px var(--mono) }
+.rate { display: inline-block; min-width: 4.4em; text-align: center; border-radius: 4px; padding: 2px 6px; font-weight: 600 }
+.rate small { font-weight: 400; opacity: .75; margin-left: 3px }
+.hi { background: var(--hit-bg); color: var(--hit) } .md { background: var(--mid-bg); color: var(--mid) }
+.lo { background: var(--miss-bg); color: var(--miss) } .na { color: var(--muted) }
+.spark { display: inline-flex; gap: 2px; align-items: flex-end; height: 22px; vertical-align: middle }
+.spark i { width: 5px; border-radius: 1px; background: var(--miss) } .spark i.o { background: var(--hit) }
+.empty { padding: 28px; color: var(--muted) }
+a { color: var(--accent) }
+footer { color: var(--muted); font-size: 12px; margin-top: 14px; max-width: 70ch }
+</style>
+</head>
+<body>
+<header><h1>WhaleScope Props</h1><span id="meta">Loading slate…</span></header>
+<div class="bar">
+  <label for="league">League<select id="league"><option value="">All</option><option>nba</option><option>wnba</option><option>nfl</option><option>mlb</option><option>nhl</option></select></label>
+  <label for="source">Book<select id="source"><option value="">All</option><option value="kalshi">Kalshi</option><option value="underdog">Underdog</option></select></label>
+  <label for="side">Side<select id="side"><option value="over">Over / Higher</option><option value="under">Under / Lower</option></select></label>
+  <label for="window">Sort by<select id="window"><option value="l5">Last 5</option><option value="l10" selected>Last 10</option><option value="l20">Last 20</option><option value="season">Season</option><option value="h2h">vs Opponent</option></select></label>
+  <label for="min_rate">Min hit rate<select id="min_rate"><option value="">Any</option><option value="0.6">60%+</option><option value="0.7">70%+</option><option value="0.8">80%+</option><option value="0.9">90%+</option></select></label>
+  <label for="min_games">Min games<select id="min_games"><option value="0">0</option><option value="3">3</option><option value="5" selected>5</option></select></label>
+  <label for="player">Player<input id="player" type="search" placeholder="Search name"></label>
+</div>
+<div class="wrap"><table>
+  <thead><tr><th>Book</th><th>Player</th><th>Prop</th><th class="num">Line</th><th class="num" title="Implied probability for this side: Kalshi ask in dollars, or Underdog American odds converted">Price</th>
+  <th class="num" data-w="l5">L5</th><th class="num" data-w="l10">L10</th><th class="num" data-w="l20">L20</th><th class="num" data-w="season">Season</th><th class="num" data-w="h2h">H2H</th><th>Last 10</th></tr></thead>
+  <tbody id="rows"><tr><td colspan="11" class="empty">Loading props…</td></tr></tbody>
+</table></div>
+<footer>Hit rate = games over the line ÷ decided games (pushes left out). Windows count games the player actually played, across seasons for L10/L20; H2H covers the current and previous two seasons, playoffs included. Past hit rates describe history and don't predict results.</footer>
+<script>
+const $ = id => document.getElementById(id);
+const ids = ["league", "source", "side", "window", "min_rate", "min_games", "player"];
+try { const s = JSON.parse(localStorage.getItem("props-filters") || "{}"); ids.forEach(k => { if (s[k] != null) $(k).value = s[k]; }); } catch (e) {}
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function cell(w, side) {
+  if (!w || w.rate == null) return '<span class="rate na">–</span>';
+  const r = side === "over" ? w.rate : 1 - w.rate, cls = r >= .7 ? "hi" : r >= .5 ? "md" : "lo";
+  return `<span class="rate ${cls}">${Math.round(r * 100)}%<small>${w.games}</small></span>`;
+}
+function spark(recent, line, side) {
+  const vals = (recent || []).slice(0, 10).reverse(); if (!vals.length) return "";
+  const max = Math.max(line * 1.6, ...vals.map(v => v.value), 1);
+  return '<span class="spark">' + vals.map(v => {
+    const hit = side === "over" ? v.value > line : v.value < line;
+    return `<i class="${hit ? "o" : ""}" style="height:${Math.max(2, 22 * v.value / max)}px" title="${esc(v.date)} ${v.home ? "vs" : "@"} ${esc(v.opp)}: ${v.value}"></i>`;
+  }).join("") + "</span>";
+}
+let timer;
+async function load() {
+  const q = new URLSearchParams(); ids.forEach(k => { if ($(k).value) q.set(k, $(k).value); });
+  try { localStorage.setItem("props-filters", JSON.stringify(Object.fromEntries(ids.map(k => [k, $(k).value])))); } catch (e) {}
+  document.querySelectorAll("th[data-w]").forEach(th => th.toggleAttribute("aria-sort", th.dataset.w === $("window").value));
+  try {
+    const res = await fetch("/api/props?" + q); const d = await res.json();
+    if (!res.ok) throw new Error(d.error || res.status);
+    for (const l of d.leagues || []) if (![...$("league").options].some(o => o.value === l)) $("league").add(new Option(l));
+    const side = $("side").value;
+    $("meta").textContent = d.updated ? `${d.count} props · updated ${new Date(d.updated * 1000).toLocaleTimeString()}` : "Building the first slate. This takes a minute or two.";
+    $("rows").innerHTML = d.props.length ? d.props.map(r => {
+      const price = side === "over" ? r.over_price : r.under_price;
+      const who = r.market_id && r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.player)}</a>` : esc(r.player);
+      return `<tr><td><span class="src">${esc(r.source)}</span></td>
+        <td><div class="player">${who}</div><div class="sub">${esc(r.league.toUpperCase())} · ${esc(r.team || "?")} vs ${esc(r.opponent || "?")}</div></td>
+        <td>${esc(r.stat_label)}</td><td class="num line">${side === "over" ? "o" : "u"}${r.line}</td>
+        <td class="num">${price ? price.toFixed(2) : ""}</td>
+        ${r.error ? `<td colspan="6" class="sub">${esc(r.error)}</td>` :
+          ["l5", "l10", "l20", "season", "h2h"].map(k => `<td class="num">${cell(r[k], side)}</td>`).join("") + `<td>${spark(r.recent, r.line, side)}</td>`}</tr>`;
+    }).join("") : '<tr><td colspan="11" class="empty">No props match these filters. Try a lower minimum hit rate or another league.</td></tr>';
+  } catch (e) { $("meta").textContent = "Couldn't load props: " + e.message; }
+  clearTimeout(timer); timer = setTimeout(load, 60000);
+}
+ids.forEach(k => $(k).addEventListener(k === "player" ? "input" : "change", load));
+document.querySelectorAll("th[data-w]").forEach(th => { th.tabIndex = 0; th.addEventListener("click", () => { $("window").value = th.dataset.w; load(); }); });
+load();
+</script>
+</body>
+</html>
