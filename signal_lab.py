@@ -21,6 +21,36 @@ def btc(name):
  if name=="kraken":return float(next(iter(fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD")["result"].values()))["c"][0])
  if name=="coinbase":return float(fetch("https://api.exchange.coinbase.com/products/BTC-USD/ticker")["price"])
  return float(fetch("https://www.bitstamp.net/api/v2/ticker/btcusd/")["last"])
+# Rounds resolve on the 60-second BRTI average before open. Kalshi posts that number as
+# floor_strike a few seconds after open; our own 60-second average is only the fallback.
+MAX_REF_GAP=float(os.getenv("SIGNAL_LAB_MAX_REF_GAP","0.015"))        # reference vs spot, as a fraction
+MAX_FALLBACK_GAP=float(os.getenv("SIGNAL_LAB_MAX_FALLBACK_GAP","5"))  # own average vs last floor_strike, dollars
+OWN_MIN_SAMPLES=6
+def composite(prices):
+ v=sorted(prices.values());n=len(v)
+ return v[n//2] if n%2 else (v[n//2-1]+v[n//2])/2
+def own_reference(samples,open_ts):
+ """Mean composite price over [open-60, open), or None without enough samples across the window."""
+ w=[(t,p) for t,p in samples if open_ts-60<=t<open_ts and p>0]
+ if len(w)<OWN_MIN_SAMPLES or w[-1][0]-w[0][0]<40:return None
+ return sum(p for _,p in w)/len(w)
+def kalshi_strike(m):
+ for k in ("floor_strike","strike_price"):
+  try:
+   v=float(m.get(k))
+   if v>0:return v
+  except (TypeError,ValueError):pass
+ return None
+def choose_reference(kalshi,own,last_kalshi,spot,final):
+ """(reference, source, skip_reason). `final` is True from the minute-2 lock on, when rows get saved."""
+ if kalshi is not None:ref,src=kalshi,"kalshi"
+ elif own is None:return None,None,"no Kalshi floor_strike and too few price samples in the 60 s before open"
+ else:
+  ref,src=own,"own"
+  if final and last_kalshi is None:return None,None,"own reference %.2f has no floor_strike to check against"%own
+  if final and abs(own-last_kalshi)>MAX_FALLBACK_GAP:return None,None,"own reference %.2f is $%.2f from last floor_strike %.2f"%(own,abs(own-last_kalshi),last_kalshi)
+ if spot>0 and abs(ref-spot)/spot>MAX_REF_GAP:return None,None,"%s reference %.2f is %.2f%% from price %.2f"%(src,ref,100*abs(ref-spot)/spot,spot)
+ return ref,src,None
 def historical_analysis():
  # Kraken OHLC includes historical candles; the final candle may still be forming.
  raw=fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=5")
@@ -82,15 +112,20 @@ def setup():
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_features_v2(ticker TEXT PRIMARY KEY, forecast DOUBLE PRECISION, distance DOUBLE PRECISION, momentum DOUBLE PRECISION, trend DOUBLE PRECISION, pattern DOUBLE PRECISION, result TEXT)")
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_baseline_v1(ticker TEXT PRIMARY KEY, leader TEXT NOT NULL, predicted TEXT NOT NULL, projected_move DOUBLE PRECISION, strike_distance DOUBLE PRECISION, recorded_at BIGINT NOT NULL)")
  # Independent "bet the current leader" baseline: own price, strike, ask and grade.
- for col in ("close_ts BIGINT","btc DOUBLE PRECISION","target DOUBLE PRECISION","leader_ask INTEGER","method TEXT","result TEXT","graded_at BIGINT"):
+ for col in ("close_ts BIGINT","btc DOUBLE PRECISION","target DOUBLE PRECISION","leader_ask INTEGER","method TEXT","result TEXT","graded_at BIGINT","reference_source TEXT"):
   q.execute("ALTER TABLE signal_lab_baseline_v1 ADD COLUMN IF NOT EXISTS "+col)
  # v2 decision snapshot at 9:00 left, with paper trades (no real orders are ever placed).
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_decisions_v2("+",".join(n+" "+t for n,t in DECISION_COLS)+")")
+ # Columns added after the table was first created; excluded_reason is set by data audits only.
+ for n,t in DECISION_COLS:
+  if n in ("reference_source","own_reference","kalshi_strike","excluded_reason"):
+   q.execute("ALTER TABLE signal_lab_decisions_v2 ADD COLUMN IF NOT EXISTS "+n+" "+t)
+ q.execute("ALTER TABLE IF EXISTS signal_lab_observations ADD COLUMN IF NOT EXISTS reference_ok BOOLEAN")
  # 5-second readings older than RETENTION_DAYS are rolled up into 1-minute rows.
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_observations_1m(ticker TEXT NOT NULL, minute_ts BIGINT NOT NULL, n INTEGER NOT NULL, btc_open DOUBLE PRECISION, btc_high DOUBLE PRECISION, btc_low DOUBLE PRECISION, btc_close DOUBLE PRECISION, reference DOUBLE PRECISION, up_ask_avg DOUBLE PRECISION, down_ask_avg DOUBLE PRECISION, up_bid_avg DOUBLE PRECISION, down_bid_avg DOUBLE PRECISION, PRIMARY KEY(ticker,minute_ts))")
  c.commit();c.close()
-DECISION_COLS=(("ticker","TEXT PRIMARY KEY"),("source","TEXT NOT NULL DEFAULT 'live'"),("decided_at","BIGINT NOT NULL"),("close_ts","BIGINT NOT NULL"),("seconds_left","INTEGER"),("btc","DOUBLE PRECISION"),("reference","DOUBLE PRECISION"),("reference_estimated","BOOLEAN"),("distance","DOUBLE PRECISION"),("up_ask","DOUBLE PRECISION"),("down_ask","DOUBLE PRECISION"),("up_bid","DOUBLE PRECISION"),("down_bid","DOUBLE PRECISION"),("spread","DOUBLE PRECISION"),("up_ask_size","DOUBLE PRECISION"),("up_bid_size","DOUBLE PRECISION"),("volume","DOUBLE PRECISION"),("realized_vol","DOUBLE PRECISION"),("mom_60","DOUBLE PRECISION"),("mom_180","DOUBLE PRECISION"),("p_market","DOUBLE PRECISION"),("p_fair","DOUBLE PRECISION"),("p_lr","DOUBLE PRECISION"),("lr_train_rows","INTEGER"),("rule_side","TEXT"),("rule_price","DOUBLE PRECISION"),("model_side","TEXT"),("model_price","DOUBLE PRECISION"),("model_edge","DOUBLE PRECISION"),("result","TEXT"),("graded_at","BIGINT"),("rule_pnl","DOUBLE PRECISION"),("model_pnl","DOUBLE PRECISION"))
-_STORED=[n for n,_ in DECISION_COLS if n not in ("result","graded_at","rule_pnl","model_pnl")]
+DECISION_COLS=(("ticker","TEXT PRIMARY KEY"),("source","TEXT NOT NULL DEFAULT 'live'"),("decided_at","BIGINT NOT NULL"),("close_ts","BIGINT NOT NULL"),("seconds_left","INTEGER"),("btc","DOUBLE PRECISION"),("reference","DOUBLE PRECISION"),("reference_estimated","BOOLEAN"),("distance","DOUBLE PRECISION"),("up_ask","DOUBLE PRECISION"),("down_ask","DOUBLE PRECISION"),("up_bid","DOUBLE PRECISION"),("down_bid","DOUBLE PRECISION"),("spread","DOUBLE PRECISION"),("up_ask_size","DOUBLE PRECISION"),("up_bid_size","DOUBLE PRECISION"),("volume","DOUBLE PRECISION"),("realized_vol","DOUBLE PRECISION"),("mom_60","DOUBLE PRECISION"),("mom_180","DOUBLE PRECISION"),("p_market","DOUBLE PRECISION"),("p_fair","DOUBLE PRECISION"),("p_lr","DOUBLE PRECISION"),("lr_train_rows","INTEGER"),("rule_side","TEXT"),("rule_price","DOUBLE PRECISION"),("model_side","TEXT"),("model_price","DOUBLE PRECISION"),("model_edge","DOUBLE PRECISION"),("result","TEXT"),("graded_at","BIGINT"),("rule_pnl","DOUBLE PRECISION"),("model_pnl","DOUBLE PRECISION"),("reference_source","TEXT"),("own_reference","DOUBLE PRECISION"),("kalshi_strike","DOUBLE PRECISION"),("excluded_reason","TEXT"))
+_STORED=[n for n,_ in DECISION_COLS if n not in ("result","graded_at","rule_pnl","model_pnl","excluded_reason")]
 def store_decisions(rows):
  """Insert decision snapshots (live or backfill); an existing round is never overwritten."""
  if not rows:return 0
@@ -109,7 +144,7 @@ def train_live_model(now):
   start=int(datetime.datetime.combine(day,datetime.time(),datetime.timezone.utc).timestamp())
   c=connect();q=c.cursor()
   cols=["close_ts","btc","reference","distance","seconds_left","realized_vol","up_bid","up_ask","mom_60","mom_180","volume","result"]
-  q.execute("SELECT "+",".join(cols)+" FROM signal_lab_decisions_v2 WHERE result IN ('yes','no') AND close_ts<%s AND NOT coalesce(reference_estimated,false)",(start,))
+  q.execute("SELECT "+",".join(cols)+" FROM signal_lab_decisions_v2 WHERE result IN ('yes','no') AND close_ts<%s AND NOT coalesce(reference_estimated,false) AND excluded_reason IS NULL",(start,))
   data=[dict(zip(cols,r)) for r in q.fetchall()];c.close()
   xs,ys,days=[],[],set()
   for r in data:
@@ -163,12 +198,12 @@ def track_features(ticker,forecast,distance,momentum,trend,pattern):
   q.execute("INSERT INTO signal_lab_features_v2(ticker,forecast,distance,momentum,trend,pattern) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,forecast,distance,momentum,trend,pattern))
   c.commit();c.close()
  except Exception as ex:print("FEATURE TRACK",repr(ex),flush=True)
-def record_baseline(ticker,close,spot,target,leader_ask,now):
+def record_baseline(ticker,close,spot,target,leader_ask,now,source):
  # Bets whichever side is currently winning; never reads the model's pick.
  leader="UP" if spot>=target else "DOWN"
  try:
   c=connect();q=c.cursor()
-  q.execute("INSERT INTO signal_lab_baseline_v1(ticker,leader,predicted,strike_distance,recorded_at,close_ts,btc,target,leader_ask,method) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,leader,leader,spot-target,now,close,spot,target,leader_ask,"current_leader_v2"))
+  q.execute("INSERT INTO signal_lab_baseline_v1(ticker,leader,predicted,strike_distance,recorded_at,close_ts,btc,target,leader_ask,method,reference_source) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(ticker) DO NOTHING",(ticker,leader,leader,spot-target,now,close,spot,target,leader_ask,"current_leader_v2",source))
   c.commit();c.close()
   return True
  except Exception as ex:print("BASELINE TRACK",repr(ex),flush=True);return False
@@ -226,10 +261,10 @@ def adaptive_weights():
  except Exception as ex:print("ADAPTIVE WEIGHTS",repr(ex),flush=True)
  return baseline
 
-def record_observation(ticker,now,spot,target,direction,market):
+def record_observation(ticker,now,spot,target,direction,market,reference_ok):
  try:
   c=connect();q=c.cursor()
-  q.execute("INSERT INTO signal_lab_observations(ts,ticker,up_bid,down_bid,btc,reference,direction,entry_signal,up_ask,down_ask) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ticker,ts) DO NOTHING",(now,ticker,market.get("yes_bid_dollars"),market.get("no_bid_dollars"),spot,target,direction,"OBSERVE",market.get("yes_ask_dollars"),market.get("no_ask_dollars")))
+  q.execute("INSERT INTO signal_lab_observations(ts,ticker,up_bid,down_bid,btc,reference,direction,entry_signal,up_ask,down_ask,reference_ok) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ticker,ts) DO NOTHING",(now,ticker,market.get("yes_bid_dollars"),market.get("no_bid_dollars"),spot,target,direction,"OBSERVE",market.get("yes_ask_dollars"),market.get("no_ask_dollars"),reference_ok))
   c.commit();c.close()
  except Exception as ex:print("OBSERVATION TRACK",repr(ex),flush=True)
 def track(ticker,close,direction,strength,now,price,yes_ask,no_ask):
@@ -263,8 +298,11 @@ def verify():
     # One market read grades every table for the round.
     m=fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{})
     time.sleep(GRADE_GAP)
+    # Grades come only from Kalshi's settled result, never from our own reference or price.
     result=str(m.get("result") or "").lower()
-    if result not in ("yes","no"):continue
+    if result not in ("yes","no"):
+     if m.get("status") in ("settled","finalized"):print("GRADE UNUSUAL RESULT",ticker,m.get("status"),repr(m.get("result")),flush=True)
+     continue
     q.execute("UPDATE signal_lab_eval_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL",(result,now,ticker))
     q.execute("UPDATE signal_lab_baseline_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL AND close_ts IS NOT NULL",(result,now,ticker))
     grade_decision(q,ticker,result,now)
@@ -378,6 +416,12 @@ def cycle():
  historical_checked=0
  depth_checked=0
  depth_data=None
+ samples=[]
+ ref_ticker=None
+ ref_logged=set()
+ own=None
+ last_kalshi=None
+ skip_reason=None
  try:
   setup()
   db_ready=True
@@ -406,33 +450,12 @@ def cycle():
    if not fresh:
     for k in ("yes_ask_dollars","no_ask_dollars","yes_bid_dollars","no_bid_dollars"):m[k]=None
    ticker=m["ticker"];close=stamp(m.get("close_time") or m.get("expiration_time"));left=max(0,close-now)
-   target=m.get("floor_strike")
-   if target is None:target=m.get("strike_price")
-   if target is None:
+   kalshi=kalshi_strike(m)
+   if kalshi is None:
     # List responses may omit strike fields. Fetch the canonical market object.
     detail=fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{})
     m={**m,**{k:v for k,v in detail.items() if v is not None}}
-    target=m.get("floor_strike")
-    if target is None:target=m.get("strike_price")
-   if target is None:
-    # Preserve the feed and log actionable diagnostics; never fabricate a strike.
-    print("TARGET MISSING",ticker,"fields",list(m.keys()),"rules",str(m.get("rules_primary") or "")[:300],flush=True)
-    # An exchange OHLC minute is only a reference estimate, not CF BRTI.
-    raw=fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1")
-    key=next(k for k in raw["result"] if k!="last")
-    minute=close-900
-    bars=[bar for bar in raw["result"][key] if int(bar[0])==minute]
-    # A 1m candle is only available after the exchange publishes it. At round
-    # rollover use the preceding completed minute until the opening bar exists.
-    if not bars:
-     previous=[bar for bar in raw["result"][key] if int(bar[0])<minute]
-     if not previous:raise RuntimeError("Estimated opening reference unavailable")
-     bars=[previous[-1]]
-     m["reference_previous_minute"]=True
-    target=float(bars[0][5]) # Kraken minute VWAP; experimental, NOT CF BRTI
-    m["estimated_reference"]=True
-    print("ESTIMATED REFERENCE",ticker,target,flush=True)
-   target=float(target)
+    kalshi=kalshi_strike(m)
    with ThreadPoolExecutor(max_workers=3) as pool:
     fs={n:pool.submit(btc,n) for n in ("kraken","coinbase","bitstamp")}
     prices={}
@@ -441,6 +464,24 @@ def cycle():
      except Exception as e:print("SPOT",n,str(e),flush=True)
    if len(prices)<2:raise RuntimeError("Fewer than two exchange feeds")
    spot=prices.get("kraken",next(iter(prices.values())))
+   # Rolling composite price; the last minute of each round is the next round's fallback reference.
+   samples=(samples+[(now,composite(prices))])[-240:]
+   if ticker!=ref_ticker:
+    ref_ticker,skip_reason,ref_logged=ticker,None,set()
+    own=own_reference(samples,close-900)
+    print("OWN REFERENCE",ticker,None if own is None else round(own,2),flush=True)
+   if kalshi is not None:
+    if own is not None and "check" not in ref_logged:
+     ref_logged.add("check");print("REFERENCE CHECK",ticker,"floor_strike",kalshi,"own",round(own,2),"gap",round(own-kalshi,2),flush=True)
+    last_kalshi=kalshi
+   # Until the minute-2 lock nothing but flagged observations is saved, so a missing
+   # floor_strike only waits; from then on (or if Kalshi's own strike is bad) the round is skipped.
+   final=left<=780
+   target,source,why=(None,None,skip_reason) if skip_reason else choose_reference(kalshi,own,last_kalshi,spot,final)
+   if why and not skip_reason and (final or kalshi is not None):
+    skip_reason=why;print("ROUND SKIPPED",ticker,why,flush=True)
+   elif why and not skip_reason and "pending" not in ref_logged:
+    ref_logged.add("pending");print("REFERENCE PENDING",ticker,why,flush=True)
    with L:
     history=list(S.get("history",[])) if S.get("ticker")==ticker else []
    if not history or now-history[-1][0]>=1:history=(history+[[now,spot]])[-900:]
@@ -473,7 +514,8 @@ def cycle():
     record_cache=saved(ticker) if db_ready else None
     last_ticker=ticker
    record=record_cache
-   if record:direction,strength,locked_at=record
+   if target is None:direction,strength,locked_at=("SKIPPED","ROUND SKIPPED: "+skip_reason,None) if skip_reason else ("ANALYZING","WAITING FOR KALSHI REFERENCE",None)
+   elif record:direction,strength,locked_at=record
    elif left<=780 and ready and historical:
     # Estimate FUTURE movement first, then compare the projected settlement to strike.
     # The current winning side is NOT a directional vote.
@@ -521,18 +563,19 @@ def cycle():
    elif left>780:direction,strength,locked_at="ANALYZING","STUDYING FIRST 2 MINUTES",None
    else:direction,strength,locked_at="ANALYZING","LOADING HISTORICAL CANDLES / MOMENTUM",None
    # Leader baseline locks at the same minute-2 point, independent of model readiness.
-   if db_ready and left<=780 and baseline_ticker!=ticker:
+   if db_ready and target is not None and left<=780 and baseline_ticker!=ticker:
     leader_ask=cents(m.get("yes_ask_dollars") if spot>=target else m.get("no_ask_dollars"))
-    if record_baseline(ticker,close,spot,target,leader_ask,now):baseline_ticker=ticker
+    if record_baseline(ticker,close,spot,target,leader_ask,now,source):baseline_ticker=ticker
    # v2 decision snapshot at exactly 9:00 left (the loop wakes on that second).
    snap_at=close-slm.DECISION_LEFT if decided_ticker!=ticker else None
-   if decided_ticker!=ticker and slm.DECISION_LEFT-15<=left<=slm.DECISION_LEFT:
+   if target is not None and decided_ticker!=ticker and slm.DECISION_LEFT-15<=left<=slm.DECISION_LEFT:
     decided_ticker=ticker
     if not fresh:
      try:
       m={**m,**{k:v for k,v in fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{}).items() if v is not None}}
      except Exception as ex:print("DECISION QUOTE",repr(ex),flush=True)
-    d=decision_snapshot(ticker,close,now,left,spot,target,m,history,m.get("estimated_reference"))
+    d=decision_snapshot(ticker,close,now,left,spot,target,m,history,source!="kalshi")
+    d.update(reference_source=source,own_reference=own,kalshi_strike=kalshi)
     with L:S["decision_v2"]={k:d.get(k) for k in ("ticker","seconds_left","p_market","p_fair","p_lr","rule_side","rule_price","model_side","model_price","model_edge")}
     if db_ready:
      try:store_decisions([d])
@@ -540,12 +583,13 @@ def cycle():
    if db_ready and now-last_verify>=60:
     last_verify=now
     verify_async()
-   if db_ready:record_observation(ticker,now,spot,target,direction,m)
-   if m.get("estimated_reference"):strength="ESTIMATED KRAKEN REFERENCE / NOT OFFICIAL BRTI"
-   conflict=direction in ("UP","DOWN") and (spot>=target)!=(direction=="UP")
+   # Readings on the provisional own reference are kept but flagged; skipped rounds save nothing.
+   if db_ready and target is not None:record_observation(ticker,now,spot,target,direction,m,source=="kalshi")
+   if source=="own":strength="OWN 60-SECOND REFERENCE / NOT YET CONFIRMED BY KALSHI"
+   conflict=direction in ("UP","DOWN") and target is not None and (spot>=target)!=(direction=="UP")
    with L:
     h=history
-    S.update(status="LIVE",error="",ticker=ticker,btc=spot,target=target,difference=spot-target,remaining=left,close_epoch=close,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=bool(m.get("estimated_reference")),conflict=conflict,cashout=cashout_signal(direction,cents(m.get("yes_ask_dollars")),cents(m.get("no_ask_dollars")),conflict,cents(m.get("yes_bid_dollars")),cents(m.get("no_bid_dollars"))),quotes=prices,depth_research=depth_data,history=h,updated=now,up_ask=cents(m.get("yes_ask_dollars")),down_ask=cents(m.get("no_ask_dollars")),up_bid=cents(m.get("yes_bid_dollars")),down_bid=cents(m.get("no_bid_dollars")))
+    S.update(status="ROUND SKIPPED" if skip_reason else "LIVE",error=skip_reason or "",ticker=ticker,btc=spot,target=target,difference=None if target is None else spot-target,remaining=left,close_epoch=close,locked=direction,strength=strength,locked_at=locked_at,tracking_online=db_ready,historical=historical,reference_is_estimated=source=="own",reference_source=source,own_reference=own,conflict=conflict,cashout=cashout_signal(direction,cents(m.get("yes_ask_dollars")),cents(m.get("no_ask_dollars")),conflict,cents(m.get("yes_bid_dollars")),cents(m.get("no_bid_dollars"))),quotes=prices,depth_research=depth_data,history=h,updated=now,up_ask=cents(m.get("yes_ask_dollars")),down_ask=cents(m.get("no_ask_dollars")),up_bid=cents(m.get("yes_bid_dollars")),down_bid=cents(m.get("no_bid_dollars")))
   except Exception as e:
    print("COLLECTOR",repr(e),flush=True)
    market=None
