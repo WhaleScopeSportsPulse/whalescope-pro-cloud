@@ -173,5 +173,33 @@ class Reference(unittest.TestCase):
         self.assertIsNone(signal_lab.choose_reference(None, None, 80000.0, 80010.0, False)[0])
 
 
+class Edge(unittest.TestCase):
+    def test_gap_against_the_midpoint_and_side_bought_at_its_ask(self):
+        self.assertEqual(slm.edge_pick(0.62, 0.50, 0.54, 0.50), {"gap_points": 10.0, "side": "YES", "entry_price": 0.54})
+        self.assertEqual(slm.edge_pick(0.40, 0.50, 0.54, 0.50), {"gap_points": -12.0, "side": "NO", "entry_price": 0.50})
+        self.assertEqual(slm.edge_pick(0.40, 0.50, 0.54, None)["entry_price"], 0.5)      # 1 - yes_bid
+        self.assertEqual(slm.edge_pick(0.52, 0.50, 0.54, 0.50)["side"], None)            # no gap, no pick
+        self.assertIsNone(slm.edge_pick(None, 0.50, 0.54, 0.50))
+        self.assertIsNone(slm.edge_pick(0.6, None, 0.54, 0.50))
+
+    def test_buckets(self):
+        self.assertEqual([slm.edge_bucket(g) for g in (0, 4.99, -4.99, 5, -9.99, 10, -25)],
+                         ["0-5", "0-5", "0-5", "5-10", "5-10", "10+", "10+"])
+
+    def test_summary_win_rate_and_profit_per_contract(self):
+        rows = [{"minute": 5, "gap_points": 3, "side": "YES", "result": "yes", "pnl": 0.4},
+                {"minute": 5, "gap_points": -4, "side": "NO", "result": "yes", "pnl": -0.6},
+                {"minute": 5, "gap_points": 12, "side": "YES", "result": "yes", "pnl": 0.3},
+                {"minute": 8, "gap_points": 7, "side": "YES", "result": "no", "pnl": -0.5},
+                {"minute": 8, "gap_points": 7, "side": "YES", "result": None, "pnl": None}]   # unsettled: ignored
+        self.assertEqual(slm.edge_summary(rows), [
+            {"minute": 5, "bucket": "0-5", "n": 2, "wins": 1, "win_rate": 0.5, "avg_pnl": -0.1},
+            {"minute": 5, "bucket": "10+", "n": 1, "wins": 1, "win_rate": 1.0, "avg_pnl": 0.3},
+            {"minute": 8, "bucket": "5-10", "n": 1, "wins": 0, "win_rate": 0.0, "avg_pnl": -0.5}])
+
+    def test_profit_includes_the_fee(self):
+        self.assertAlmostEqual(slm.pnl(True, 0.54), 1 - 0.54 - 0.07 * 0.54 * 0.46)
+
+
 if __name__ == "__main__":
     unittest.main()
