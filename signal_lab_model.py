@@ -199,6 +199,27 @@ def calibration(ps: Sequence[float], ys: Sequence[int], bins: int = 10) -> list[
     return out
 
 
+def holdout_eval(xs: Sequence[Sequence[float]], ys: Sequence[int], test_frac: float = 0.2) -> Optional[dict]:
+    """Fit on the oldest rows, score the newest `test_frac` of them. Rows must be in time order.
+
+    The baseline always predicts the training set's majority outcome; base_rate is the
+    training set's share of "yes" rounds, the rate that baseline is built from."""
+    n = len(xs)
+    test = int(round(n * test_frac))
+    if test < 1 or n - test < 2:
+        return None
+    train_x, train_y, test_x, test_y = xs[:-test], ys[:-test], xs[-test:], ys[-test:]
+    model = Logistic().fit(train_x, train_y)
+    ps = [model.predict(x) for x in test_x]
+    base_rate = sum(train_y) / len(train_y)
+    majority = int(base_rate >= 0.5)
+    return {"rows": n, "train": n - test, "test": test,
+            "acc": round(sum((p >= 0.5) == bool(y) for p, y in zip(ps, test_y)) / test, 4),
+            "brier": brier(ps, test_y), "logloss": log_loss(ps, test_y),
+            "base_rate": round(base_rate, 4),
+            "baseline_acc": round(sum(y == majority for y in test_y) / test, 4)}
+
+
 def trade_summary(pnls: Sequence[float]) -> dict:
     n = len(pnls)
     if not n:
