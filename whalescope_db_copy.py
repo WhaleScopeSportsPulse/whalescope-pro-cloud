@@ -71,6 +71,14 @@ def main():
     dst.execute(same_text)
     dst.execute(f"CREATE TABLE IF NOT EXISTS {LOG}(schema_name TEXT, table_name TEXT, source_rows BIGINT, target_rows BIGINT,"
                 " source_md5 TEXT, target_md5 TEXT, status TEXT, checked_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(schema_name, table_name))")
+    dst.execute(f"CREATE TABLE IF NOT EXISTS {LOG}_done(finished_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    finished = dst.execute(f"SELECT max(finished_at) FROM {LOG}_done").fetchone()[0]
+    if finished:
+        # Never touch the source again once a copy verified; it may no longer exist.
+        print("COPY ALREADY COMPLETE at", finished.isoformat(), "- nothing to do", flush=True)
+        for r in dst.execute(f"SELECT schema_name, table_name, source_rows, target_rows, status FROM {LOG} ORDER BY 1, 2"):
+            print("COPY VERIFIED", *r, flush=True)
+        return 0
     done = dst.execute(f"SELECT count(*), count(*) FILTER (WHERE status='verified') FROM {LOG}").fetchone()
     src = psycopg.connect(src_url, autocommit=False)
     src.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -81,6 +89,7 @@ def main():
     if done[0] and done[0] == done[1] == len(found):
         for r in dst.execute(f"SELECT schema_name, table_name, source_rows, target_rows, status FROM {LOG} ORDER BY 1, 2"):
             print("COPY ALREADY VERIFIED", *r, flush=True)
+        dst.execute(f"INSERT INTO {LOG}_done DEFAULT VALUES")
         return 0
     if size > MAX_SOURCE_BYTES:
         print("COPY ABORTED: source is larger than MAX_SOURCE_BYTES; nothing copied", flush=True)
@@ -143,6 +152,8 @@ def main():
     for seq, fq, col in sequences:
         dst.execute(f"SELECT setval(%s, coalesce((SELECT max({q(col)}) FROM {fq}), 0) + 1, false)", (seq,))
     src.rollback()
+    if ok:
+        dst.execute(f"INSERT INTO {LOG}_done DEFAULT VALUES")
     print("COPY DONE" if ok else "COPY FINISHED WITH MISMATCHES", flush=True)
     return 0 if ok else 1
 
