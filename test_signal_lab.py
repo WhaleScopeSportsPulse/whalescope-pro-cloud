@@ -133,6 +133,45 @@ class Snapshot(unittest.TestCase):
         self.assertNotIn("rule_side", est)                      # no paper trades on an estimated reference
 
 
+class HoldoutEval(unittest.TestCase):
+    def test_trains_on_oldest_rows_and_scores_the_newest(self):
+        xs = [[float(i)] for i in range(100)]
+        ys = [i % 2 for i in range(100)]
+        seen = []
+        real_fit = slm.Logistic.fit
+
+        def spy(self, fx, fy, iters=25):
+            seen.append([x[0] for x in fx])
+            return real_fit(self, fx, fy, iters)
+
+        with mock.patch.object(slm.Logistic, "fit", spy):
+            ev = slm.holdout_eval(xs, ys)
+        self.assertEqual((ev["rows"], ev["train"], ev["test"]), (100, 80, 20))
+        self.assertEqual(seen, [[float(i) for i in range(80)]])   # never sees the last 20 rows
+
+    def test_baseline_is_training_majority(self):
+        xs = [[float(i % 3)] for i in range(50)]
+        ys = [1] * 30 + [1, 0] * 5 + [0] * 10                     # train 40 rows: 35 yes; test 10 rows: all no
+        ev = slm.holdout_eval(xs, ys)
+        self.assertEqual(ev["base_rate"], 0.875)
+        self.assertEqual(ev["baseline_acc"], 0.0)
+
+    def test_metrics_on_a_learnable_signal(self):
+        rows = synthetic()
+        xs, ys = [], []
+        for r in rows:
+            x = slm.features(r)
+            if x:
+                xs.append(x); ys.append(r["up"])
+        ev = slm.holdout_eval(xs, ys)
+        self.assertGreater(ev["acc"], ev["baseline_acc"])
+        self.assertLess(ev["brier"], 0.25)
+        self.assertLess(ev["logloss"], math.log(2))
+
+    def test_too_few_rows(self):
+        self.assertIsNone(slm.holdout_eval([[1.0], [2.0]], [0, 1]))
+
+
 class Reference(unittest.TestCase):
     OPEN = 1_800_000_000
 

@@ -144,13 +144,18 @@ def train_live_model(now):
   start=int(datetime.datetime.combine(day,datetime.time(),datetime.timezone.utc).timestamp())
   c=connect();q=c.cursor()
   cols=["close_ts","btc","reference","distance","seconds_left","realized_vol","up_bid","up_ask","mom_60","mom_180","volume","result"]
-  q.execute("SELECT "+",".join(cols)+" FROM signal_lab_decisions_v2 WHERE result IN ('yes','no') AND close_ts<%s AND NOT coalesce(reference_estimated,false) AND excluded_reason IS NULL",(start,))
+  q.execute("SELECT "+",".join(cols)+" FROM signal_lab_decisions_v2 WHERE result IN ('yes','no') AND close_ts<%s AND NOT coalesce(reference_estimated,false) AND excluded_reason IS NULL ORDER BY close_ts,ticker",(start,))
   data=[dict(zip(cols,r)) for r in q.fetchall()];c.close()
   xs,ys,days=[],[],set()
   for r in data:
    x=slm.features(r)
    if x:xs.append(x);ys.append(int(r["result"]=="yes"));days.add(r["close_ts"]//86400)
   if len(days)>=3 and len(xs)>=200:
+   # Evaluation only: fit on the older 80%, score the newest 20%. The live model below is unchanged.
+   try:
+    ev=slm.holdout_eval(xs,ys)
+    if ev:print("LR EVAL "+" ".join(k+"="+str(ev[k]) for k in ("rows","test","acc","brier","logloss","base_rate","baseline_acc")),flush=True)
+   except Exception as ex:print("LR EVAL",repr(ex),flush=True)
    LR.update(model=slm.Logistic().fit(xs,ys),rows=len(xs),day=day)
    print("LR TRAINED",len(xs),"rows",len(days),"days",flush=True)
   else:print("LR NOT TRAINED: need 3 days and 200 rounds, have",len(days),len(xs),flush=True)
