@@ -175,6 +175,50 @@ def rule_trade(btc: float, reference: float, up_ask: Optional[float], down_ask: 
     return side, ask
 
 
+# --- edge tracker (observation only; never trades) ---------------------------
+
+EDGE_LEFT = (600, 420)         # seconds left at minute 5 and minute 8 of the round
+EDGE_BUCKETS = ((0, 5, "0-5"), (5, 10, "5-10"), (10, None, "10+"))
+
+
+def edge_pick(p_yes: Optional[float], yes_bid: Optional[float], yes_ask: Optional[float],
+              no_ask: Optional[float]) -> Optional[dict]:
+    """Gap = (model P(YES) - Kalshi bid/ask midpoint) in points; the model's side is the one
+    it rates above the market, bought at that side's ask."""
+    mid = market_prob(yes_bid, yes_ask)
+    if p_yes is None or mid is None:
+        return None
+    gap = round((p_yes - mid) * 100, 2)
+    if gap == 0:
+        return {"gap_points": 0.0, "side": None, "entry_price": None}
+    side = "YES" if gap > 0 else "NO"
+    entry = yes_ask if side == "YES" else (no_ask if no_ask is not None else round(1 - yes_bid, 4))
+    return {"gap_points": gap, "side": side, "entry_price": entry}
+
+
+def edge_bucket(gap_points: float) -> str:
+    g = abs(gap_points)
+    for lo, hi, name in EDGE_BUCKETS:
+        if g >= lo and (hi is None or g < hi):
+            return name
+    return EDGE_BUCKETS[-1][2]
+
+
+def edge_summary(rows: Iterable[dict]) -> list[dict]:
+    """Win rate and average profit per contract by minute and gap bucket.
+    Each row needs minute, gap_points, side, result ('yes'/'no') and pnl."""
+    groups: dict = {}
+    for r in rows:
+        if not r.get("side") or r.get("result") not in ("yes", "no") or r.get("pnl") is None:
+            continue
+        g = groups.setdefault((r["minute"], edge_bucket(r["gap_points"])), [])
+        g.append(((r["side"] == "YES") == (r["result"] == "yes"), r["pnl"]))
+    order = {name: i for i, (_, _, name) in enumerate(EDGE_BUCKETS)}
+    return [{"minute": m, "bucket": b, "n": len(v), "wins": sum(w for w, _ in v),
+             "win_rate": round(sum(w for w, _ in v) / len(v), 4), "avg_pnl": round(sum(p for _, p in v) / len(v), 4)}
+            for (m, b), v in sorted(groups.items(), key=lambda kv: (kv[0][0], order[kv[0][1]]))]
+
+
 # --- evaluation -------------------------------------------------------------
 
 def brier(ps: Sequence[float], ys: Sequence[int]) -> Optional[float]:

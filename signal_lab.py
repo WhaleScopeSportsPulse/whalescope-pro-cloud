@@ -121,6 +121,9 @@ def setup():
   if n in ("reference_source","own_reference","kalshi_strike","excluded_reason"):
    q.execute("ALTER TABLE signal_lab_decisions_v2 ADD COLUMN IF NOT EXISTS "+n+" "+t)
  q.execute("ALTER TABLE IF EXISTS signal_lab_observations ADD COLUMN IF NOT EXISTS reference_ok BOOLEAN")
+ # Edge tracker: LR P(YES) vs Kalshi's quote at minute 5 and minute 8. Observation only; no orders.
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_edge_v1(ticker TEXT NOT NULL, minute INTEGER NOT NULL, close_ts BIGINT NOT NULL, recorded_at BIGINT NOT NULL, seconds_left INTEGER, p_lr DOUBLE PRECISION, lr_train_rows INTEGER, yes_bid DOUBLE PRECISION, yes_ask DOUBLE PRECISION, no_bid DOUBLE PRECISION, no_ask DOUBLE PRECISION, gap_points DOUBLE PRECISION, side TEXT, entry_price DOUBLE PRECISION, btc DOUBLE PRECISION, reference DOUBLE PRECISION, reference_source TEXT, result TEXT, graded_at BIGINT, pnl DOUBLE PRECISION, PRIMARY KEY(ticker,minute))")
+ q.execute("CREATE TABLE IF NOT EXISTS signal_lab_edge_daily(day DATE NOT NULL, minute INTEGER NOT NULL, bucket TEXT NOT NULL, n INTEGER NOT NULL, wins INTEGER NOT NULL, win_rate DOUBLE PRECISION, avg_pnl DOUBLE PRECISION, computed_at BIGINT NOT NULL, PRIMARY KEY(day,minute,bucket))")
  # 5-second readings older than RETENTION_DAYS are rolled up into 1-minute rows.
  q.execute("CREATE TABLE IF NOT EXISTS signal_lab_observations_1m(ticker TEXT NOT NULL, minute_ts BIGINT NOT NULL, n INTEGER NOT NULL, btc_open DOUBLE PRECISION, btc_high DOUBLE PRECISION, btc_low DOUBLE PRECISION, btc_close DOUBLE PRECISION, reference DOUBLE PRECISION, up_ask_avg DOUBLE PRECISION, down_ask_avg DOUBLE PRECISION, up_bid_avg DOUBLE PRECISION, down_bid_avg DOUBLE PRECISION, PRIMARY KEY(ticker,minute_ts))")
  c.commit();c.close()
@@ -286,12 +289,51 @@ def grade_decision(q,ticker,result,now):
  won=lambda side:(side=="UP")==(result=="yes")
  q.execute("UPDATE signal_lab_decisions_v2 SET result=%s,graded_at=%s,rule_pnl=%s,model_pnl=%s WHERE ticker=%s AND result IS NULL",
            (result,now,round(slm.pnl(won(rs),rp),4) if rs else None,round(slm.pnl(won(ms),mp),4) if ms else None,ticker))
+EDGE_COLS=("ticker","minute","close_ts","recorded_at","seconds_left","p_lr","lr_train_rows","yes_bid","yes_ask","no_bid","no_ask","gap_points","side","entry_price","btc","reference","reference_source")
+def record_edge(ticker,close,now,left,minute,spot,target,source,m,history):
+ """One minute-5/8 observation: LR P(YES) against Kalshi's quote. Never places an order."""
+ d=decision_snapshot(ticker,close,now,left,spot,target,m,history,source!="kalshi")
+ if d["p_lr"] is None:
+  print("EDGE SKIPPED",ticker,"minute="+str(minute),"no trained LR model yet",flush=True);return None
+ pick=slm.edge_pick(d["p_lr"],d["up_bid"],d["up_ask"],d["down_ask"]) or {}
+ row={"ticker":ticker,"minute":minute,"close_ts":close,"recorded_at":now,"seconds_left":left,"p_lr":d["p_lr"],"lr_train_rows":d["lr_train_rows"],
+      "yes_bid":d["up_bid"],"yes_ask":d["up_ask"],"no_bid":d["down_bid"],"no_ask":d["down_ask"],"btc":spot,"reference":target,"reference_source":source,**pick}
+ c=connect();q=c.cursor()
+ q.execute("INSERT INTO signal_lab_edge_v1("+",".join(EDGE_COLS)+") VALUES ("+",".join(["%s"]*len(EDGE_COLS))+") ON CONFLICT(ticker,minute) DO NOTHING",tuple(row.get(k) for k in EDGE_COLS))
+ c.commit();c.close()
+ print("EDGE",ticker,"minute="+str(minute),"p_yes="+str(row["p_lr"]),"yes_bid="+str(row["yes_bid"]),"yes_ask="+str(row["yes_ask"]),"gap="+str(row.get("gap_points")),"side="+str(row.get("side")),flush=True)
+ return row
+def grade_edge(q,ticker,result,now):
+ q.execute("SELECT minute,side,entry_price FROM signal_lab_edge_v1 WHERE ticker=%s AND result IS NULL",(ticker,))
+ for minute,side,entry in q.fetchall():
+  pnl=round(slm.pnl((side=="YES")==(result=="yes"),entry),4) if side and entry is not None else None
+  q.execute("UPDATE signal_lab_edge_v1 SET result=%s,graded_at=%s,pnl=%s WHERE ticker=%s AND minute=%s AND result IS NULL",(result,now,pnl,ticker,minute))
+  print("EDGE RESULT",ticker,"minute="+str(minute),"side="+str(side),"result="+result,"pnl="+str(pnl),flush=True)
+EDGE_DAY={"done":None}
+def edge_rows(q,where,args):
+ q.execute("SELECT minute,gap_points,side,result,pnl FROM signal_lab_edge_v1 WHERE reference_source='kalshi' AND "+where,args)
+ return [dict(zip(("minute","gap_points","side","result","pnl"),r)) for r in q.fetchall()]
+def edge_daily(q,now):
+ """Once per UTC day, summarize yesterday's settled edge rows by minute and gap bucket."""
+ day=datetime.datetime.fromtimestamp(now,datetime.timezone.utc).date()
+ if EDGE_DAY["done"]==day or now%86400<1800:return
+ end=int(datetime.datetime.combine(day,datetime.time(),datetime.timezone.utc).timestamp());start=end-86400
+ q.execute("SELECT count(*) FROM signal_lab_edge_v1 WHERE close_ts>%s AND close_ts<=%s AND result IS NULL",(start,end))
+ if q.fetchone()[0] and now%86400<3*3600:return  # give late settlements until 03:00 UTC
+ prev=day-datetime.timedelta(days=1)
+ summary=slm.edge_summary(edge_rows(q,"close_ts>%s AND close_ts<=%s",(start,end)))
+ for s in summary:
+  q.execute("INSERT INTO signal_lab_edge_daily VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(day,minute,bucket) DO UPDATE SET n=EXCLUDED.n,wins=EXCLUDED.wins,win_rate=EXCLUDED.win_rate,avg_pnl=EXCLUDED.avg_pnl,computed_at=EXCLUDED.computed_at",
+            (prev,s["minute"],s["bucket"],s["n"],s["wins"],s["win_rate"],s["avg_pnl"],now))
+  print("EDGE DAILY",prev.isoformat(),"minute="+str(s["minute"]),"gap="+s["bucket"],"n="+str(s["n"]),"win_rate="+str(s["win_rate"]),"avg_pnl="+str(s["avg_pnl"]),flush=True)
+ if not summary:print("EDGE DAILY",prev.isoformat(),"no settled edge rows",flush=True)
+ EDGE_DAY["done"]=day
 def verify():
  try:
   c=connect();q=c.cursor();now=int(time.time())
   pending=[]
   if now%900>=PROPS_WINDOW:
-   q.execute("SELECT ticker FROM (SELECT ticker,close_ts FROM signal_lab_eval_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_baseline_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_decisions_v2 WHERE result IS NULL AND close_ts<%s) p GROUP BY ticker ORDER BY min(close_ts) LIMIT 15",(now-30,now-30,now-30))
+   q.execute("SELECT ticker FROM (SELECT ticker,close_ts FROM signal_lab_eval_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_baseline_v1 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_decisions_v2 WHERE result IS NULL AND close_ts<%s UNION SELECT ticker,close_ts FROM signal_lab_edge_v1 WHERE result IS NULL AND close_ts<%s) p GROUP BY ticker ORDER BY min(close_ts) LIMIT 15",(now-30,now-30,now-30,now-30))
    pending=[x[0] for x in q.fetchall()]
   for ticker in pending:
    try:
@@ -306,6 +348,7 @@ def verify():
     q.execute("UPDATE signal_lab_eval_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL",(result,now,ticker))
     q.execute("UPDATE signal_lab_baseline_v1 SET result=%s,graded_at=%s WHERE ticker=%s AND result IS NULL AND close_ts IS NOT NULL",(result,now,ticker))
     grade_decision(q,ticker,result,now)
+    grade_edge(q,ticker,result,now)
     c.commit()
    except Exception as e:
     print("GRADE",ticker,repr(e),flush=True)
@@ -325,6 +368,10 @@ def verify():
   perf["model_audit"]=model_audit()
   perf["leader_comparison"]=baseline_report()
   perf["decisions_v2"]=decisions_report(q)
+  try:
+   perf["edge"]=slm.edge_summary(edge_rows(q,"result IS NOT NULL",()))
+   edge_daily(q,now);c.commit()
+  except Exception as ex:c.rollback();print("EDGE SUMMARY",repr(ex),flush=True)
   with L:S["performance"]=perf
   c.close()
  except Exception as e:print("VERIFY",repr(e),flush=True)
@@ -395,6 +442,10 @@ def find_market(now):
  ms=sorted(candidates,key=lambda m:stamp(m.get("close_time") or m.get("expiration_time") or ""))
  if not ms:raise RuntimeError("Kalshi did not return a currently trading BTC 15-minute market")
  return ms[0]
+def refresh_quotes(m,ticker,label):
+ """Fresh quotes for a snapshot when this tick's poll failed; (market, fresh)."""
+ try:return {**m,**{k:v for k,v in fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{}).items() if v is not None}},True
+ except Exception as ex:print(label+" QUOTE",repr(ex),flush=True);return m,False
 verifying=threading.Lock()
 def verify_async():
  # Grading fetches up to 15 markets; keep it off the 5-second observation loop.
@@ -409,6 +460,7 @@ def cycle():
  market=None
  baseline_ticker=None
  decided_ticker=None
+ edge_done=set()
  snap_at=None
  last_ticker=None
  record_cache=None
@@ -566,20 +618,28 @@ def cycle():
    if db_ready and target is not None and left<=780 and baseline_ticker!=ticker:
     leader_ask=cents(m.get("yes_ask_dollars") if spot>=target else m.get("no_ask_dollars"))
     if record_baseline(ticker,close,spot,target,leader_ask,now,source):baseline_ticker=ticker
+   # Edge tracker at minute 5 and minute 8 (10:00 and 7:00 left). Observation only; no orders.
+   for edge_left in slm.EDGE_LEFT:
+    if target is not None and (ticker,edge_left) not in edge_done and edge_left-15<=left<=edge_left:
+     edge_done.add((ticker,edge_left))
+     if not fresh:m,fresh=refresh_quotes(m,ticker,"EDGE")
+     if db_ready:
+      try:record_edge(ticker,close,now,left,15-edge_left//60,spot,target,source,m,history)
+      except Exception as ex:print("EDGE TRACK",repr(ex),flush=True)
+   edge_done={k for k in edge_done if k[0]==ticker}
    # v2 decision snapshot at exactly 9:00 left (the loop wakes on that second).
-   snap_at=close-slm.DECISION_LEFT if decided_ticker!=ticker else None
    if target is not None and decided_ticker!=ticker and slm.DECISION_LEFT-15<=left<=slm.DECISION_LEFT:
     decided_ticker=ticker
-    if not fresh:
-     try:
-      m={**m,**{k:v for k,v in fetch(BASE+"markets/"+urllib.parse.quote(ticker,safe="")).get("market",{}).items() if v is not None}}
-     except Exception as ex:print("DECISION QUOTE",repr(ex),flush=True)
+    if not fresh:m,fresh=refresh_quotes(m,ticker,"DECISION")
     d=decision_snapshot(ticker,close,now,left,spot,target,m,history,source!="kalshi")
     d.update(reference_source=source,own_reference=own,kalshi_strike=kalshi)
     with L:S["decision_v2"]={k:d.get(k) for k in ("ticker","seconds_left","p_market","p_fair","p_lr","rule_side","rule_price","model_side","model_price","model_edge")}
     if db_ready:
      try:store_decisions([d])
      except Exception as ex:print("DECISION TRACK",repr(ex),flush=True)
+   # Next snapshot second this round (edge minutes and the 9:00 decision); the loop wakes on it.
+   wakes=[close-x for x in slm.EDGE_LEFT if (ticker,x) not in edge_done]+([close-slm.DECISION_LEFT] if decided_ticker!=ticker else [])
+   snap_at=min([w for w in wakes if w>now],default=None)
    if db_ready and now-last_verify>=60:
     last_verify=now
     verify_async()
@@ -608,7 +668,7 @@ def cycle():
    # first seconds are recorded.
    time.sleep(10 if "429" in str(e) else 1 if "currently trading" in str(e) else 14)
   # One single-market request per tick; sleep only the remainder of the interval,
-  # or wake exactly at the 9:00-left decision second if it falls inside it.
+  # or wake exactly at the next snapshot second (edge minutes, 9:00 decision) if it falls inside it.
   wait=max(0.5,OBSERVE_SECONDS-(time.time()-tick))
   if snap_at and time.time()<snap_at<=time.time()+wait:wait=snap_at-time.time()+0.05
   time.sleep(wait)
